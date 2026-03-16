@@ -99,6 +99,27 @@
 						<span class="big-number">{stats.total_price_points.toLocaleString()}</span>
 					</div>
 				</div>
+				{#if stats.categories && Object.keys(stats.categories).length > 0}
+					<div class="category-table">
+						<h4>Categories</h4>
+						<table>
+							<thead>
+								<tr>
+									<th>Category</th>
+									<th>Markets</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each Object.entries(stats.categories).sort((a, b) => b[1] - a[1]) as [cat, count]}
+									<tr>
+										<td>{cat}</td>
+										<td>{count}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>
@@ -188,5 +209,41 @@
 		font-size: 28px;
 		font-weight: 700;
 		color: var(--blue);
+	}
+
+	.category-table {
+		margin-top: 16px;
+		border-top: 1px solid var(--border);
+		padding-top: 12px;
+	}
+
+	.category-table h4 {
+		font-size: 12px;
+		font-weight: 600;
+		margin-bottom: 8px;
+	}
+
+	.category-table table {
+		width: 100%;
+		font-size: 12px;
+		border-collapse: collapse;
+	}
+
+	.category-table th,
+	.category-table td {
+		text-align: left;
+		padding: 4px 8px;
+	}
+
+	.category-table th {
+		color: var(--text-dim);
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		font-size: 10px;
+	}
+
+	.category-table tr:nth-child(even) {
+		background: var(--bg);
 	}
 </style>

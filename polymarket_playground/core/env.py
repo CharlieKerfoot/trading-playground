@@ -37,6 +37,7 @@ class TradingEnv(gym.Env):
 
         self.executor = PaperExecutor(config=self.config)
         max_steps = self.config.get("max_steps", 50)
+        self.position_limit: float = self.config.get("position_limit", 10.0)
         self.data = HistoricalLoader(cache, max_steps=max_steps)
         self.position: Position | None = None
         self.state: MarketState | None = None
@@ -63,6 +64,30 @@ class TradingEnv(gym.Env):
         if isinstance(action, dict):
             action = Action.from_dict(action)
 
+        # Handle close on flat position as hold
+        if action.direction == 3:  # close
+            if self.position.is_flat:
+                action = Action(direction=0, size=0.0)  # treat as hold
+            else:
+                # Override size to actual position size
+                actual_size = self.position.yes_shares + self.position.no_shares
+                action = Action(direction=3, size=actual_size, reasoning=action.reasoning)
+
+        # Clamp action size so position doesn't exceed limit
+        if action.direction in (1, 2):  # buy_yes or buy_no
+            current_shares = (
+                self.position.yes_shares if action.direction == 1
+                else self.position.no_shares
+            )
+            headroom = max(0.0, self.position_limit - current_shares)
+            action = Action(
+                direction=action.direction,
+                size=min(action.size, headroom),
+                reasoning=action.reasoning,
+            )
+            if action.size <= 0:
+                action = Action(direction=0, size=0.0)  # treat as hold
+
         fill = self.executor.execute(action, self.state)
         self.position.update(fill)
         self.state = self.data.advance()
@@ -73,6 +98,9 @@ class TradingEnv(gym.Env):
 
         if terminated:
             reward += self.position.settlement_pnl(self.state.resolution)
+        elif truncated:
+            # Close-out P&L at current market price so RL gets a signal
+            reward += self.position.close_value(self.state.yes_price) - self.position.cost_basis
 
         return self._obs(), reward, terminated, truncated, self._info(fill)
 

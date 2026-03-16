@@ -37,6 +37,9 @@ class HistoricalLoader:
         self._state: MarketState | None = None
         # Current episode's price series (sliced window from cache)
         self._episode_prices: list[float] = []
+        # Cached per-episode data (avoid repeated DB queries)
+        self._episode_outcome: float | None = None
+        self._episode_meta: dict = {}
         # Available market IDs (refreshed on filter change)
         self._market_ids: list[str] = []
         self._refresh_market_list()
@@ -47,6 +50,15 @@ class HistoricalLoader:
         self._market_ids = [m["id"] for m in markets]
         logger.info(
             "Historical loader: %d markets available",
+            len(self._market_ids),
+        )
+
+    def set_market_filter(self, category: str) -> None:
+        """Filter markets to a specific category."""
+        self._market_ids = self.cache.get_market_ids_by_category(category)
+        logger.info(
+            "Filtered to category '%s': %d markets",
+            category,
             len(self._market_ids),
         )
 
@@ -98,6 +110,14 @@ class HistoricalLoader:
         prices = [h["p"] for h in history]
         meta = self.cache.get_market_metadata(market_id) or {}
 
+        # Cache per-episode data
+        self._episode_meta = meta
+
+        row = self.cache._conn.execute(
+            "SELECT outcome FROM markets WHERE id = ?", (market_id,)
+        ).fetchone()
+        self._episode_outcome = float(row["outcome"]) if row and row["outcome"] is not None else None
+
         # Slice a random window
         window_size = self.max_steps + 1
         if len(prices) <= window_size:
@@ -107,14 +127,6 @@ class HistoricalLoader:
             self._episode_prices = prices[start : start + window_size]
 
         question = meta.get("question", market_id)
-
-        # Determine resolution
-        outcome = None
-        row = self.cache._conn.execute(
-            "SELECT outcome FROM markets WHERE id = ?", (market_id,)
-        ).fetchone()
-        if row and row["outcome"] is not None:
-            outcome = float(row["outcome"])
 
         # Build initial state
         yes_price = self._episode_prices[0]
@@ -126,7 +138,7 @@ class HistoricalLoader:
             is_resolved=False,
             resolution=None,
             market_meta=meta,
-            outcome=outcome,
+            outcome=self._episode_outcome,
         )
         return self._state
 
@@ -138,14 +150,7 @@ class HistoricalLoader:
 
         # Resolve on the last step
         is_last = self._step >= self.max_steps - 1
-        meta = self.cache.get_market_metadata(self._state.market_id) or {}
-
-        outcome = None
-        row = self.cache._conn.execute(
-            "SELECT outcome FROM markets WHERE id = ?", (self._state.market_id,)
-        ).fetchone()
-        if row and row["outcome"] is not None:
-            outcome = float(row["outcome"])
+        outcome = self._episode_outcome
 
         is_resolved = is_last and outcome is not None
         resolution = outcome if is_resolved else None
@@ -157,7 +162,7 @@ class HistoricalLoader:
             time_elapsed=round(elapsed_frac, 4),
             is_resolved=is_resolved,
             resolution=resolution,
-            market_meta=meta,
+            market_meta=self._episode_meta,
             outcome=outcome,
         )
         return self._state

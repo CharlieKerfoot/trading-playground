@@ -25,7 +25,8 @@ class MarketCache:
         question    TEXT NOT NULL,
         outcome     REAL,
         volume      REAL NOT NULL DEFAULT 0,
-        metadata    TEXT NOT NULL DEFAULT '{}'
+        metadata    TEXT NOT NULL DEFAULT '{}',
+        category    TEXT
     );
     """
 
@@ -50,13 +51,89 @@ class MarketCache:
         self._conn.execute(self._CREATE_MARKETS)
         self._conn.execute(self._CREATE_PRICES)
         self._conn.execute(self._CREATE_PRICE_INDEX)
+        self._migrate_category_column()
         self._conn.commit()
         self._client = PolymarketClient()
+
+    def _migrate_category_column(self) -> None:
+        """Add category column if it doesn't exist (migration for existing DBs)."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(markets)").fetchall()
+        }
+        if "category" not in cols:
+            self._conn.execute("ALTER TABLE markets ADD COLUMN category TEXT")
+            self._backfill_categories()
+
+    def _backfill_categories(self) -> None:
+        """Backfill categories for existing cached markets from stored metadata."""
+        rows = self._conn.execute(
+            "SELECT id, metadata FROM markets WHERE category IS NULL"
+        ).fetchall()
+        for row in rows:
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            category = self._extract_category(meta)
+            if category:
+                self._conn.execute(
+                    "UPDATE markets SET category = ? WHERE id = ?",
+                    (category, row["id"]),
+                )
+        if rows:
+            logger.info("Backfilled categories for %d markets", len(rows))
+
+    @staticmethod
+    def _extract_category(meta: dict) -> str | None:
+        """Extract category from Polymarket metadata."""
+        # Prefer groupItemTitle (event-level category)
+        group = meta.get("groupItemTitle")
+        if group:
+            return group
+
+        # Fall back to first tag
+        tags = meta.get("tags")
+        if tags:
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except (json.JSONDecodeError, TypeError):
+                    tags = []
+            if isinstance(tags, list) and tags:
+                tag = tags[0]
+                if isinstance(tag, dict):
+                    return tag.get("label") or tag.get("slug")
+                return str(tag)
+        return None
+
+    @staticmethod
+    def _determine_outcome(market: dict) -> float | None:
+        """Determine market outcome from resolution data.
+
+        For resolved markets, outcomePrices will show 1.0/0.0 (or very close).
+        """
+        yes_price, no_price = PolymarketClient.parse_outcome_prices(market)
+
+        # A resolved market will have prices at 1.0/0.0 or 0.0/1.0
+        if yes_price >= 0.95:
+            return 1.0
+        if no_price >= 0.95:
+            return 0.0
+
+        # Check explicit resolution fields
+        resolution = market.get("resolution")
+        if resolution is not None:
+            try:
+                return float(resolution)
+            except (ValueError, TypeError):
+                pass
+
+        # Not clearly resolved
+        return None
 
     def sync(
         self,
         *,
         limit: int = 100,
+        category: str | None = None,
         on_progress: callable | None = None,
     ) -> dict:
         """Fetch resolved markets from Polymarket and cache them locally.
@@ -81,7 +158,7 @@ class MarketCache:
                     offset=offset,
                     order="volume24hr",
                     ascending=False,
-                    tag=None,
+                    tag=category,
                 )
             except Exception as e:
                 logger.error("Failed to fetch markets at offset %d: %s", offset, e)
@@ -135,20 +212,23 @@ class MarketCache:
                     skipped += 1
                     continue
 
-                # Determine outcome
-                yes_price, _ = PolymarketClient.parse_outcome_prices(m)
-                outcome = 1.0 if yes_price > 0.5 else 0.0
+                # Determine outcome from resolution data
+                outcome = self._determine_outcome(m)
+
+                # Extract category
+                cat = self._extract_category(m)
 
                 # Store market
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO markets (id, question, outcome, volume, metadata) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO markets (id, question, outcome, volume, metadata, category) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         market_id,
                         m.get("question", ""),
                         outcome,
                         float(m.get("volume", 0) or 0),
                         json.dumps(m, default=str),
+                        cat,
                     ),
                 )
 
@@ -173,7 +253,7 @@ class MarketCache:
     def get_markets(self) -> list[dict]:
         """Return all cached markets."""
         rows = self._conn.execute(
-            "SELECT id, question, outcome, volume FROM markets ORDER BY volume DESC"
+            "SELECT id, question, outcome, volume, category FROM markets ORDER BY volume DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -186,6 +266,14 @@ class MarketCache:
             return json.loads(row["metadata"])
         return None
 
+    def get_market_ids_by_category(self, category: str) -> list[str]:
+        """Return market IDs matching the given category."""
+        rows = self._conn.execute(
+            "SELECT id FROM markets WHERE category = ? ORDER BY volume DESC",
+            (category,),
+        ).fetchall()
+        return [row["id"] for row in rows]
+
     def get_price_history(self, market_id: str) -> list[dict]:
         """Return price history for a market as list of {t, p} dicts."""
         rows = self._conn.execute(
@@ -195,13 +283,21 @@ class MarketCache:
         return [{"t": r["timestamp"], "p": r["price"]} for r in rows]
 
     def stats(self) -> dict:
-        """Return cache statistics: total markets, total price points."""
+        """Return cache statistics: total markets, total price points, categories."""
         total = self._conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
         points = self._conn.execute("SELECT COUNT(*) AS cnt FROM price_history").fetchone()["cnt"]
+
+        # Category breakdown
+        cat_rows = self._conn.execute(
+            "SELECT COALESCE(category, 'uncategorized') AS cat, COUNT(*) AS cnt "
+            "FROM markets GROUP BY cat ORDER BY cnt DESC"
+        ).fetchall()
+        categories = {row["cat"]: row["cnt"] for row in cat_rows}
 
         return {
             "total_markets": total,
             "total_price_points": points,
+            "categories": categories,
         }
 
     def _market_exists(self, market_id: str) -> bool:

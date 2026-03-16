@@ -5,6 +5,7 @@ const BASE = '';
 export interface DataStats {
 	total_markets: number;
 	total_price_points: number;
+	categories: Record<string, number>;
 }
 
 export interface SyncStatus {
