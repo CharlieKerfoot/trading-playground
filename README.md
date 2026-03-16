@@ -1,6 +1,6 @@
 # Trading Playground
 
-Agent-agnostic, market-agnostic training environment for prediction market agents. Uses **real Polymarket market data** — historical prices, orderbooks, and signals from the Gamma and CLOB APIs. Plug in Claude, RL policies, or rule-based bots — all against the same Gymnasium-compatible environment.
+Agent-agnostic, market-agnostic training environment for prediction market agents. Uses **real Polymarket data** — historical prices, orderbooks, and signals from the Gamma and CLOB APIs. Plug in Claude, RL policies, or rule-based bots — all against the same Gymnasium-compatible environment.
 
 ## Quick Start
 
@@ -9,27 +9,26 @@ Agent-agnostic, market-agnostic training environment for prediction market agent
 uv sync
 cd web && npm install && cd ..
 
+# Sync resolved markets from Polymarket
+uv run python cli.py sync --limit 100
+
 # Launch the web interface (opens browser automatically)
-uv run python cli.py run
+uv run python cli.py serve
 
-# Run headless (CLI only, no web interface)
-uv run python cli.py run --headless --agent rule --market btc --episodes 10
+# Or run an agent from the CLI
+uv run python cli.py run --agent rule --episodes 50
 ```
-
-By default, all commands launch the web dashboard. Add `--headless` to run in CLI-only mode.
 
 ## Web Interface
 
-The web dashboard starts automatically when you run any command. It launches both the FastAPI backend and the SvelteKit frontend, then opens your browser.
+The web dashboard starts with `cli.py serve`. It launches both the FastAPI backend and the SvelteKit frontend, then opens your browser.
 
-### Features
+**Pages:**
 
-- **Real Polymarket data** — Historical prices, orderbooks, and signals from the Polymarket API
-- **Manual trading** — Buy YES/NO, Hold, or Close positions with adjustable size
-- **Agent visualization** — Watch Rule, Claude, or Random agents trade in real-time
-- **Live dashboard** — Price display, position tracking, P&L chart, signals panel, trade history
-- **WebSocket streaming** — Agent actions broadcast in real-time via WebSocket
-- **Synthetic fallback** — BTC, Elections, Sports, and Macro synthetic markets for offline testing
+- **Dashboard** (`/`) — Overview stats (total markets, price points, categories, runs) and recent training runs
+- **Data** (`/data`) — Sync resolved Polymarket markets into the local SQLite cache, view category breakdowns
+- **Train** (`/train`) — Configure and launch training runs: pick an agent, set parameters, choose episode count and category filter
+- **Runs** (`/runs`) — Browse all training runs, click into any run for live WebSocket progress, episode-by-episode rewards, and final metrics (Sharpe, win rate, P&L, max drawdown)
 
 ### Manual startup
 
@@ -45,37 +44,50 @@ cd web && npm run dev
 
 ## CLI Commands
 
+### `serve` — Launch the web UI
+
+```bash
+uv run python cli.py serve [--host 0.0.0.0] [--port 8000]
+```
+
+### `sync` — Download market data
+
+```bash
+uv run python cli.py sync --limit 100 [--category btc]
+```
+
 ### `run` — Run an agent
 
 ```bash
-# Opens web interface (default)
-uv run python cli.py run
-
-# Headless mode
-uv run python cli.py run --headless \
-  --agent rule \        # rule | claude | rl | random
-  --market btc \        # btc | elections | sports | macro
-  --episodes 10
-```
-
-### `compare` — Head-to-head agent comparison
-
-```bash
-uv run python cli.py compare --headless \
-  --agents rule --agents random \
-  --market btc \
+uv run python cli.py run \
+  --agent rule \        # rule | claude | rl | random | rl:path/to/model
   --episodes 50 \
-  --seed 42
+  --category btc        # optional: filter markets by category
 ```
 
 ### `train` — Train an RL agent
 
 ```bash
 uv run python cli.py train \
-  --market btc \          # btc | elections | sports | macro
-  --timesteps 100000 \    # training steps
+  --timesteps 100000 \
   --algorithm PPO \       # PPO | A2C
+  --category btc \
   --save-path models/my_model
+```
+
+### `compare` — Head-to-head agent comparison
+
+```bash
+uv run python cli.py compare \
+  --agents rule --agents random \
+  --episodes 50 \
+  --category btc
+```
+
+### `stats` — Show cached data statistics
+
+```bash
+uv run python cli.py stats
 ```
 
 ## Architecture
@@ -83,45 +95,43 @@ uv run python cli.py train \
 ```
 polymarket_playground/
 ├── core/           # TradingEnv, MarketState, Action, Position
-├── markets/        # Pluggable market adapters (BTC, elections, sports, macro)
-├── data/           # Polymarket client, historical replay
-├── execution/      # Paper executor with slippage model
 ├── agents/         # Claude, RL, rule-based agents
-├── eval/           # Episode runner, metrics, comparison, visualization, RL training
-├── config/         # YAML configs per market type
-└── server.py       # FastAPI + WebSocket backend for the web interface
+├── markets/        # Pluggable market adapters (Polymarket)
+├── data/           # Polymarket client, SQLite cache, historical replay
+├── execution/      # Paper executor with slippage model
+├── eval/           # Episode runner, metrics, comparison, RL training
+├── training/       # Run manager for batch training
+├── config/         # YAML configs for environment parameters
+└── server.py       # FastAPI + WebSocket backend
 
-web/                # SvelteKit frontend
+web/                # SvelteKit frontend (Svelte 5 + TypeScript)
 ├── src/
 │   ├── lib/
-│   │   ├── api.ts              # TypeScript API client
-│   │   └── components/         # Svelte 5 UI components
-│   │       ├── PriceDisplay    # YES/NO prices with bid/ask spreads
-│   │       ├── PositionPanel   # Position sizes and P&L
-│   │       ├── TradePanel      # Manual trading controls
-│   │       ├── SignalsPanel    # Market signals and time progress
-│   │       ├── PnlChart        # SVG cumulative P&L + price chart
-│   │       └── HistoryTable    # Scrollable trade history
+│   │   ├── api.ts          # TypeScript API client
+│   │   └── components/     # MetricsCard, RunsTable, AgentConfigurator, etc.
 │   └── routes/
-│       └── +page.svelte        # Main dashboard
-└── vite.config.ts              # Vite proxy to FastAPI backend
+│       ├── +page.svelte    # Dashboard
+│       ├── data/           # Data sync & management
+│       ├── train/          # Training configuration
+│       └── runs/           # Run listing & detail views
+└── vite.config.ts          # Vite proxy to FastAPI backend
 ```
 
 ### Design Principles
 
-1. **Agent-agnostic** — Claude, RL policies, and rule-based bots all implement the same `BaseAgent.act(state) -> Action` interface.
-
-2. **Market-agnostic** — Market-specific logic (signals, context formatting, episode selection) lives in swappable `MarketAdapter` plugins. Adding a new market type = adding one file in `markets/`.
-
-3. **Training-focused** — Historical replay with paper execution. All agents train and evaluate against resolved market data.
+1. **Agent-agnostic** — All agents implement `BaseAgent.act(state) -> Action`. Claude, RL policies, and rule-based bots share the same interface.
+2. **Market-agnostic** — Market-specific logic lives in swappable `MarketAdapter` plugins. Adding a new market = one file in `markets/`.
+3. **Training-focused** — Historical replay with paper execution. No live trading — all agents train and evaluate against resolved market data.
 
 ### Key Abstractions
 
-- **`MarketState`** — Universal market snapshot (prices, spreads, book depth, time, external signals). Every agent sees the same struct.
-- **`MarketAdapter`** — Pluggable market logic. Fetches market-specific signals and builds agent context.
-- **`TradingEnv`** — Gymnasium-compatible environment. Market-agnostic core loop.
-- **`BaseAgent`** — Agent interface. `act(state) -> Action`. Agents extract what they need from `MarketState` (language for Claude, numpy for RL, raw fields for rules).
-- **`PaperExecutor`** — Simulated fills with slippage model.
+| Abstraction | Role |
+|-------------|------|
+| `MarketState` | Universal market snapshot: prices, spreads, book depth, time, external signals |
+| `MarketAdapter` | Pluggable market logic — fetches signals and builds agent context |
+| `TradingEnv` | Gymnasium-compatible environment with configurable fees, position limits, and step count |
+| `BaseAgent` | Agent interface: `act(state) -> Action` |
+| `PaperExecutor` | Simulated fills with configurable slippage model |
 
 ## Agents
 
@@ -129,14 +139,12 @@ web/                # SvelteKit frontend
 |-------|-------------|
 | `rule` | Deterministic baseline — buys YES below 0.3, NO above 0.7 |
 | `claude` | Claude API agent with multi-turn conversation history per episode |
-| `rl` | SB3-compatible RL policy wrapper (load with `rl:path/to/model`) |
+| `rl` | SB3-compatible RL policy wrapper (load trained model with `rl:path/to/model`) |
 | `random` | Random actions (RL agent with no policy) |
 
 ## Markets
 
-### Polymarket (Historical)
-
-The app loads resolved markets from Polymarket for historical replay. Each market provides signals:
+Resolved markets synced from Polymarket's public API into a local SQLite cache. No API key required.
 
 | Signal | Description |
 |--------|-------------|
@@ -146,17 +154,6 @@ The app loads resolved markets from Polymarket for historical replay. Each marke
 | `last_trade_price` | Most recent trade |
 | `volume_24hr` | 24-hour trading volume (USDC) |
 | `liquidity` | Available liquidity |
-
-No API key required — Polymarket's market data endpoints are public.
-
-### Synthetic Markets (Offline Fallback)
-
-| Market | Adapter | Signals |
-|--------|---------|---------|
-| `btc` | `BTCPriceAdapter` | btc_spot, btc_delta_1m/5m, funding_rate, book_imbalance, realized_vol |
-| `elections` | `ElectionAdapter` | poll_average, news_sentiment, prediction_market_consensus |
-| `sports` | `SportsAdapter` | live_score, time_remaining, odds_from_bookmakers |
-| `macro` | `MacroAdapter` | prev_reading, analyst_consensus, market_implied_prob |
 
 ## Configuration
 
@@ -170,19 +167,13 @@ env:
   fee_rate: 0.02
 ```
 
-Market-specific configs (e.g. `btc.yaml`) override base settings.
-
 ## Claude Agent Setup
 
 The Claude agent requires an Anthropic API key:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-uv run python cli.py run --headless --agent claude --market btc --episodes 5
+uv run python cli.py run --agent claude --episodes 5
 ```
 
-Without the key, the agent degrades gracefully (holds every step). The agent:
-- Receives natural-language market context from the adapter
-- Maintains multi-turn conversation history within each episode
-- Tracks its own position and P&L in the prompt
-- Responds with structured JSON actions
+Without the key, the agent degrades gracefully (holds every step).

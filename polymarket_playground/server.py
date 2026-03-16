@@ -1,210 +1,65 @@
-"""FastAPI backend for the trading playground web interface."""
+"""FastAPI backend for the batch training playground."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import random
-import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from polymarket_playground.core.action import Action, DIRECTION_MAP
 from polymarket_playground.core.env import TradingEnv
-from polymarket_playground.core.state import MarketState
-from polymarket_playground.core.types import EpisodeResult
-from polymarket_playground.data.historical_loader import HistoricalLoader
-from polymarket_playground.data.polymarket_client import PolymarketClient
-from polymarket_playground.markets.polymarket import PolymarketAdapter
-from polymarket_playground.markets.btc_price import BTCPriceAdapter
-from polymarket_playground.markets.elections import ElectionAdapter
-from polymarket_playground.markets.sports import SportsAdapter
-from polymarket_playground.markets.macro import MacroAdapter
+from polymarket_playground.data.market_cache import MarketCache
+from polymarket_playground.training.run_manager import RunManager, RunStatus, TrainingRun
 
 logger = logging.getLogger(__name__)
 
-# Shared Polymarket adapter (fetches markets once, reused across sessions)
-_polymarket_client = PolymarketClient()
-_polymarket_adapter: PolymarketAdapter | None = None
-# Resolved market metadata from historical loader (populated at startup)
-_historical_markets: dict[str, dict] = {}
-
-
-def _get_polymarket_adapter() -> PolymarketAdapter | None:
-    """Lazy-init the shared PolymarketAdapter."""
-    global _polymarket_adapter
-    if _polymarket_adapter is None:
-        try:
-            _polymarket_adapter = PolymarketAdapter(client=_polymarket_client)
-            if not _polymarket_adapter.get_markets():
-                logger.warning("No Polymarket markets available, falling back to synthetic")
-                _polymarket_adapter = None
-        except Exception as e:
-            logger.warning("Failed to init PolymarketAdapter: %s", e)
-            _polymarket_adapter = None
-    return _polymarket_adapter
-
-
-# Fallback synthetic adapters
-SYNTHETIC_ADAPTERS = {
-    "btc": BTCPriceAdapter,
-    "elections": ElectionAdapter,
-    "sports": SportsAdapter,
-    "macro": MacroAdapter,
+AGENT_TYPES = {
+    "rule": {
+        "name": "Rule Agent",
+        "description": "Simple threshold-based strategy (buy YES < 0.3, buy NO > 0.7)",
+        "config_params": {},
+    },
+    "claude": {
+        "name": "Claude Agent",
+        "description": "Reasons over market context using Claude API",
+        "config_params": {"model": "claude-sonnet-4-6"},
+    },
+    "random": {
+        "name": "Random Agent",
+        "description": "Random actions for baseline comparison",
+        "config_params": {},
+    },
+    "rl": {
+        "name": "RL Agent",
+        "description": "Reinforcement learning policy (PPO/A2C). Train first, then select a saved model.",
+        "config_params": {"model_path": "", "algorithm": "PPO"},
+    },
 }
 
-AGENT_TYPES = ["rule", "claude", "random", "rl"]
+# Globals initialized at startup
+_cache: MarketCache | None = None
+_run_manager: RunManager | None = None
+_sync_task: asyncio.Task | None = None
+_sync_status: dict = {"running": False, "fetched": 0, "skipped": 0, "errors": 0}
+_rl_train_task: asyncio.Task | None = None
+_rl_train_status: dict = {"running": False, "timesteps": 0, "algorithm": "", "save_path": ""}
 
 
-# ---------------------------------------------------------------------------
-# Session management
-# ---------------------------------------------------------------------------
+def _get_cache() -> MarketCache:
+    global _cache
+    if _cache is None:
+        _cache = MarketCache()
+    return _cache
 
 
-class TradingSession:
-    """A single trading session (one env + one agent or manual)."""
-
-    def __init__(self, session_id: str, market: str, agent_type: str | None = None):
-        self.session_id = session_id
-        self.market = market
-        self.agent_type = agent_type
-
-        # Use real Polymarket data if market is a Polymarket market ID
-        poly = _get_polymarket_adapter()
-        if poly and (market in poly.get_markets() or market in _historical_markets):
-            self.adapter = poly
-            self.is_polymarket = True
-        elif market in SYNTHETIC_ADAPTERS:
-            self.adapter = SYNTHETIC_ADAPTERS[market]()
-            self.is_polymarket = False
-        else:
-            # Assume it's a Polymarket market ID we haven't cached yet
-            if poly:
-                self.adapter = poly
-                self.is_polymarket = True
-            else:
-                self.adapter = BTCPriceAdapter()
-                self.is_polymarket = False
-
-        self.env = TradingEnv(
-            adapter=self.adapter,
-            config={"max_steps": 100},
-        )
-
-        # Share the pre-warmed price cache with this session's loader
-        if self.is_polymarket and _shared_loader and isinstance(self.env.data, HistoricalLoader):
-            self.env.data._price_cache = _shared_loader._price_cache
-            self.env.data._market_meta = _shared_loader._market_meta
-            self.env.data._token_cache = _shared_loader._token_cache
-
-        # For Polymarket markets, pin the loader to this specific market
-        if self.is_polymarket:
-            if hasattr(self.env.data, 'set_market'):
-                self.env.data.set_market(market)
-            self.env.reset()
-        else:
-            self.env.reset()
-
-        self.history: list[dict] = []
-        self.step_count = 0
-        self.running = False
-        self._agent = None
-
-    def get_state_dict(self) -> dict:
-        """Serialize current state for the frontend."""
-        state = self.env.state
-        pos = self.env.position
-        return {
-            "session_id": self.session_id,
-            "market": self.market,
-            "agent_type": self.agent_type,
-            "step": self.step_count,
-            "running": self.running,
-            "state": {
-                "market_id": state.market_id,
-                "market_type": state.market_type,
-                "question": state.question,
-                "yes_price": state.yes_price,
-                "no_price": state.no_price,
-                "yes_bid": state.yes_bid,
-                "yes_ask": state.yes_ask,
-                "no_bid": state.no_bid,
-                "no_ask": state.no_ask,
-                "spread": state.spread,
-                "book_depth": state.book_depth,
-                "time_elapsed": state.time_elapsed,
-                "time_remaining": state.time_remaining,
-                "signals": state.signals,
-                "is_resolved": state.is_resolved,
-            },
-            "position": {
-                "yes_shares": pos.yes_shares if pos else 0,
-                "no_shares": pos.no_shares if pos else 0,
-                "net_exposure": pos.net_exposure if pos else 0,
-                "cost_basis": pos.cost_basis if pos else 0,
-            },
-            "history": self.history[-50:],
-            "total_pnl": sum(h.get("reward", 0) for h in self.history),
-        }
-
-    def execute_action(self, action_dict: dict) -> dict:
-        """Execute a single action and return the result."""
-        action = Action.from_dict(action_dict)
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self.step_count += 1
-
-        entry = {
-            "step": self.step_count,
-            "action": action.direction_name,
-            "size": action.size,
-            "reasoning": action.reasoning,
-            "reward": reward,
-            "yes_price": self.env.state.yes_price,
-            "terminated": terminated,
-            "truncated": truncated,
-        }
-        self.history.append(entry)
-
-        return {
-            "entry": entry,
-            "done": terminated or truncated,
-            **self.get_state_dict(),
-        }
-
-    def reset(self):
-        """Reset the environment for a new episode."""
-        if self.is_polymarket and hasattr(self.env.data, 'set_market'):
-            self.env.data.set_market(self.market)
-        self.env.reset()
-        self.history = []
-        self.step_count = 0
-        self.running = False
-
-    def get_agent(self):
-        """Lazy-load the agent."""
-        if self._agent is not None:
-            return self._agent
-
-        if self.agent_type == "rule":
-            from polymarket_playground.agents.rule_agent import RuleAgent
-            self._agent = RuleAgent()
-        elif self.agent_type == "claude":
-            from polymarket_playground.agents.claude_agent import ClaudeAgent
-            self._agent = ClaudeAgent(adapter=self.adapter)
-        elif self.agent_type == "random":
-            from polymarket_playground.agents.rl_agent import RLAgent
-            self._agent = RLAgent(policy=None)
-        elif self.agent_type == "rl":
-            from polymarket_playground.agents.rl_agent import RLAgent
-            self._agent = RLAgent(policy=None)
-        return self._agent
-
-
-sessions: dict[str, TradingSession] = {}
+def _get_run_manager() -> RunManager:
+    global _run_manager
+    if _run_manager is None:
+        _run_manager = RunManager()
+    return _run_manager
 
 
 # ---------------------------------------------------------------------------
@@ -216,27 +71,27 @@ class ConnectionManager:
     def __init__(self):
         self.connections: dict[str, list[WebSocket]] = {}
 
-    async def connect(self, session_id: str, ws: WebSocket):
+    async def connect(self, run_id: str, ws: WebSocket):
         await ws.accept()
-        self.connections.setdefault(session_id, []).append(ws)
+        self.connections.setdefault(run_id, []).append(ws)
 
-    def disconnect(self, session_id: str, ws: WebSocket):
-        if session_id in self.connections:
-            self.connections[session_id] = [
-                c for c in self.connections[session_id] if c != ws
+    def disconnect(self, run_id: str, ws: WebSocket):
+        if run_id in self.connections:
+            self.connections[run_id] = [
+                c for c in self.connections[run_id] if c != ws
             ]
 
-    async def broadcast(self, session_id: str, data: dict):
-        if session_id not in self.connections:
+    async def broadcast(self, run_id: str, data: dict):
+        if run_id not in self.connections:
             return
         dead = []
-        for ws in self.connections[session_id]:
+        for ws in self.connections[run_id]:
             try:
                 await ws.send_json(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.connections[session_id].remove(ws)
+            self.connections[run_id].remove(ws)
 
 
 manager = ConnectionManager()
@@ -246,27 +101,23 @@ manager = ConnectionManager()
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-# Shared historical loader (pre-warms price cache at startup, reused by sessions)
-_shared_loader: HistoricalLoader | None = None
-
-
-def _get_shared_loader(adapter) -> HistoricalLoader:
-    """Get or create the shared HistoricalLoader with pre-fetched price data."""
-    global _shared_loader, _historical_markets
-    if _shared_loader is None:
-        _shared_loader = HistoricalLoader(adapter, max_steps=100)
-        _historical_markets = dict(_shared_loader._market_meta)
-        logger.info("Pre-loaded %d markets for historical replay", len(_historical_markets))
-    return _shared_loader
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm the Polymarket adapter and historical loader
-    poly = _get_polymarket_adapter()
-    if poly:
-        _get_shared_loader(poly)
+    # Initialize cache at startup
+    _get_cache()
+    _get_run_manager()
+    stats = _get_cache().stats()
+    if stats["total_markets"] == 0:
+        logger.info("Market cache is empty. Use POST /api/data/sync to fetch markets.")
+    else:
+        logger.info(
+            "Market cache: %d markets, %d price points",
+            stats["total_markets"],
+            stats["total_price_points"],
+        )
     yield
+
 
 app = FastAPI(title="Trading Playground", lifespan=lifespan)
 
@@ -278,147 +129,248 @@ app.add_middleware(
 )
 
 
-@app.get("/api/markets")
-async def list_markets():
-    """List available markets — resolved Polymarket + synthetic fallbacks."""
-    markets = []
+# ---------------------------------------------------------------------------
+# Data endpoints
+# ---------------------------------------------------------------------------
 
-    # Resolved Polymarket markets (from historical loader cache)
-    if _historical_markets:
-        for mid, m in _historical_markets.items():
-            yes_price, no_price = PolymarketClient.parse_outcome_prices(m)
-            markets.append({
-                "id": mid,
-                "name": m.get("question", mid)[:80],
-                "type": "polymarket",
-                "yes_price": yes_price,
-                "no_price": no_price,
-                "volume_24hr": m.get("volume24hr", 0),
-                "liquidity": m.get("liquidityNum", 0),
-                "resolved": bool(m.get("closed", False)),
-                "signals": PolymarketAdapter.SIGNALS,
-            })
 
-    # Synthetic fallbacks
-    markets.append({"id": "btc", "name": "BTC Price (Synthetic)", "type": "synthetic", "signals": BTCPriceAdapter.SIGNALS})
-    markets.append({"id": "elections", "name": "Elections (Synthetic)", "type": "synthetic", "signals": ElectionAdapter.SIGNALS})
-    markets.append({"id": "sports", "name": "Sports (Synthetic)", "type": "synthetic", "signals": SportsAdapter.SIGNALS})
-    markets.append({"id": "macro", "name": "Macro (Synthetic)", "type": "synthetic", "signals": MacroAdapter.SIGNALS})
+@app.get("/api/data/stats")
+async def data_stats():
+    """Return cached market stats."""
+    return _get_cache().stats()
 
-    return {"markets": markets}
+
+@app.post("/api/data/sync")
+async def data_sync(body: dict[str, Any] | None = None):
+    """Trigger a background sync of resolved markets."""
+    global _sync_task, _sync_status
+
+    if _sync_status["running"]:
+        return {"status": "already_running", **_sync_status}
+
+    body = body or {}
+    limit = body.get("limit", 100)
+
+    _sync_status = {"running": True, "fetched": 0, "skipped": 0, "errors": 0}
+
+    async def _run_sync():
+        global _sync_status
+        try:
+            cache = _get_cache()
+
+            def on_progress(fetched, skipped, errors):
+                _sync_status.update(
+                    fetched=fetched, skipped=skipped, errors=errors
+                )
+
+            # Run sync in a thread to avoid blocking the event loop
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: cache.sync(limit=limit, on_progress=on_progress),
+            )
+            _sync_status.update(**result, running=False)
+        except Exception as e:
+            _sync_status["running"] = False
+            _sync_status["error"] = str(e)
+            logger.exception("Sync failed")
+
+    _sync_task = asyncio.create_task(_run_sync())
+    return {"status": "started"}
+
+
+@app.get("/api/data/sync/status")
+async def sync_status():
+    """Return current sync progress."""
+    return _sync_status
+
+
+# ---------------------------------------------------------------------------
+# Run endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/runs")
+async def create_run(body: dict[str, Any]):
+    """Create and start a training run."""
+    rm = _get_run_manager()
+    cache = _get_cache()
+
+    agent_type = body.get("agent_type", "rule")
+    num_episodes = body.get("num_episodes", 50)
+    agent_config = body.get("agent_config", {})
+
+    run = rm.create_run(
+        agent_type=agent_type,
+        num_episodes=num_episodes,
+        agent_config=agent_config,
+    )
+
+    # Create env with cache
+    env = TradingEnv(cache=cache, config={"max_steps": 100})
+
+    async def on_progress(r: TrainingRun):
+        await manager.broadcast(
+            r.id,
+            {
+                "type": "progress",
+                "current_episode": r.current_episode,
+                "num_episodes": r.num_episodes,
+                "latest_reward": round(r.results[-1].total_reward, 6) if r.results else 0,
+                "metrics": r.metrics(),
+            },
+        )
+
+    await rm.start_run(run.id, env, on_progress=on_progress)
+    return run.to_dict()
+
+
+@app.get("/api/runs")
+async def list_runs():
+    """List all training runs."""
+    rm = _get_run_manager()
+    return {"runs": [r.to_dict() for r in rm.list_runs()]}
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str):
+    """Get run details + results."""
+    rm = _get_run_manager()
+    run = rm.get_run(run_id)
+    if not run:
+        return {"error": "Run not found"}
+    return run.to_dict()
+
+
+@app.get("/api/runs/{run_id}/metrics")
+async def get_run_metrics(run_id: str):
+    """Get computed metrics for a run."""
+    rm = _get_run_manager()
+    run = rm.get_run(run_id)
+    if not run:
+        return {"error": "Run not found"}
+    return run.metrics()
+
+
+@app.delete("/api/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Cancel and delete a run."""
+    rm = _get_run_manager()
+    if rm.delete_run(run_id):
+        return {"status": "deleted"}
+    return {"error": "Run not found"}
+
+
+# ---------------------------------------------------------------------------
+# Agent endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.get("/api/agents")
 async def list_agents():
+    """List available agent types with configurable params."""
     return {"agents": AGENT_TYPES}
 
 
-@app.post("/api/sessions")
-async def create_session(body: dict[str, Any]):
-    market = body.get("market", "btc")
-    agent_type = body.get("agent_type")
-    session_id = f"s_{random.randint(10000, 99999)}_{int(time.time())}"
-
-    session = TradingSession(session_id, market, agent_type)
-    sessions[session_id] = session
-    return session.get_state_dict()
+# ---------------------------------------------------------------------------
+# RL Training endpoints
+# ---------------------------------------------------------------------------
 
 
-@app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str):
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-    return sessions[session_id].get_state_dict()
+@app.post("/api/train/rl")
+async def train_rl(body: dict[str, Any]):
+    """Start RL training in the background."""
+    global _rl_train_task, _rl_train_status
+
+    if _rl_train_status["running"]:
+        return {"status": "already_running", **_rl_train_status}
+
+    timesteps = body.get("timesteps", 100_000)
+    algorithm = body.get("algorithm", "PPO").upper()
+    save_path = body.get("save_path", f"models/{algorithm.lower()}_agent")
+
+    _rl_train_status = {
+        "running": True,
+        "timesteps": timesteps,
+        "algorithm": algorithm,
+        "save_path": save_path,
+        "progress": 0,
+        "error": None,
+    }
+
+    async def _run_training():
+        global _rl_train_status
+        try:
+            from pathlib import Path
+            from polymarket_playground.eval.train import RLTrainer
+
+            cache = _get_cache()
+            env = TradingEnv(cache=cache, config={"max_steps": 100})
+
+            def do_train():
+                trainer = RLTrainer(env, algorithm=algorithm)
+                trainer.train(timesteps=timesteps)
+                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                trainer.save(save_path)
+
+            await asyncio.get_event_loop().run_in_executor(None, do_train)
+            _rl_train_status.update(running=False, progress=timesteps)
+        except Exception as e:
+            _rl_train_status["running"] = False
+            _rl_train_status["error"] = str(e)
+            logger.exception("RL training failed")
+
+    _rl_train_task = asyncio.create_task(_run_training())
+    return {"status": "started", **_rl_train_status}
 
 
-@app.post("/api/sessions/{session_id}/action")
-async def session_action(session_id: str, body: dict[str, Any]):
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-
-    session = sessions[session_id]
-    result = session.execute_action(body)
-
-    await manager.broadcast(session_id, {"type": "step", **result})
-    return result
+@app.get("/api/train/rl/status")
+async def rl_train_status():
+    """Return RL training progress."""
+    return _rl_train_status
 
 
-@app.post("/api/sessions/{session_id}/reset")
-async def session_reset(session_id: str):
-    if session_id not in sessions:
-        return {"error": "Session not found"}
+@app.get("/api/models")
+async def list_models():
+    """List saved RL models."""
+    from pathlib import Path
 
-    sessions[session_id].reset()
-    return sessions[session_id].get_state_dict()
+    models_dir = Path("models")
+    if not models_dir.exists():
+        return {"models": []}
 
-
-@app.post("/api/sessions/{session_id}/run")
-async def run_agent(session_id: str, body: dict[str, Any] | None = None):
-    """Start an agent running in the background."""
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-
-    session = sessions[session_id]
-    if session.agent_type is None:
-        return {"error": "No agent configured for manual session"}
-
-    steps = (body or {}).get("steps", 50)
-    delay = (body or {}).get("delay", 0.3)
-    session.running = True
-
-    async def _run():
-        agent = session.get_agent()
-        agent.on_reset(session.env.state)
-        for _ in range(steps):
-            if not session.running:
-                break
-            action = agent.act(session.env.state)
-            result = session.execute_action({
-                "action": action.direction_name,
-                "size": action.size,
-                "reasoning": action.reasoning,
+    models = []
+    for f in models_dir.iterdir():
+        if f.suffix == ".zip" or (f.is_file() and not f.suffix):
+            name = f.stem if f.suffix == ".zip" else f.name
+            models.append({
+                "name": name,
+                "path": str(f),
+                "size_bytes": f.stat().st_size,
             })
-            await manager.broadcast(session_id, {"type": "step", **result})
-            if result.get("done"):
-                break
-            await asyncio.sleep(delay)
-        session.running = False
-        await manager.broadcast(session_id, {"type": "done", **session.get_state_dict()})
-
-    asyncio.create_task(_run())
-    return {"status": "started", "session_id": session_id}
+    return {"models": models}
 
 
-@app.post("/api/sessions/{session_id}/stop")
-async def stop_agent(session_id: str):
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-    sessions[session_id].running = False
-    return {"status": "stopped"}
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
 
 
-@app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str):
-    if session_id in sessions:
-        sessions[session_id].running = False
-        del sessions[session_id]
-    return {"status": "deleted"}
-
-
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await manager.connect(session_id, websocket)
+@app.websocket("/ws/runs/{run_id}")
+async def websocket_run(websocket: WebSocket, run_id: str):
+    """Live progress streaming for a training run."""
+    await manager.connect(run_id, websocket)
     try:
-        if session_id in sessions:
-            await websocket.send_json({
-                "type": "state",
-                **sessions[session_id].get_state_dict(),
-            })
+        # Send current state immediately
+        rm = _get_run_manager()
+        run = rm.get_run(run_id)
+        if run:
+            await websocket.send_json({"type": "state", **run.to_dict()})
 
+        # Keep connection alive, listen for client messages
         while True:
             data = await websocket.receive_json()
-            if data.get("type") == "action" and session_id in sessions:
-                result = sessions[session_id].execute_action(data)
-                await manager.broadcast(session_id, {"type": "step", **result})
+            if data.get("type") == "cancel":
+                rm.cancel_run(run_id)
+                await websocket.send_json({"type": "cancelled"})
     except WebSocketDisconnect:
-        manager.disconnect(session_id, websocket)
+        manager.disconnect(run_id, websocket)
