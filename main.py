@@ -239,12 +239,21 @@ def train(agent: str, episodes: int, category: str | None):
 @click.option("--algorithm", default="PPO", help="RL algorithm: PPO, A2C")
 @click.option("--category", default=None, help="Filter by category")
 @click.option("--save-path", default=None, help="Path to save trained model")
-def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: str | None):
-    """Train an RL agent using Stable-Baselines3."""
+@click.option("--eval-episodes", default=50, help="Episodes to run for evaluation after training")
+def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: str | None, eval_episodes: int):
+    """Train an RL agent using Stable-Baselines3, then evaluate."""
     from pathlib import Path
     from polymarket_playground.core.env import TradingEnv
     from polymarket_playground.data.market_cache import MarketCache
     from polymarket_playground.eval.train import RLTrainer
+    from polymarket_playground.eval.metrics import (
+        avg_pnl,
+        max_drawdown,
+        sharpe_ratio,
+        win_rate,
+    )
+    from polymarket_playground.eval.runner import EpisodeRunner
+    from polymarket_playground.agents.rl_agent import RLAgent
 
     cache = MarketCache()
     stats = cache.stats()
@@ -268,6 +277,38 @@ def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: st
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     trainer.save(save_path)
     console.print(f"[green]Model saved to {save_path}[/green]")
+
+    # Evaluate the trained model using the same normalization stats
+    console.print(f"\n[bold]Evaluating trained model ({eval_episodes} episodes)...[/bold]")
+    from stable_baselines3.common.evaluation import evaluate_policy
+    from polymarket_playground.eval.train import GymWrapper
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    eval_env = TradingEnv(cache=cache, config={"max_steps": 100})
+    if category:
+        eval_env.data.set_market_filter(category)
+    eval_wrapped = GymWrapper(eval_env)
+    eval_vec = DummyVecEnv([lambda: eval_wrapped])
+    # Copy normalization stats from training
+    eval_norm = VecNormalize(eval_vec, norm_obs=True, norm_reward=False, training=False)
+    eval_norm.obs_rms = trainer.vec_env.obs_rms
+    eval_norm.ret_rms = trainer.vec_env.ret_rms
+
+    mean_reward, std_reward = evaluate_policy(
+        trainer.model, eval_norm, n_eval_episodes=eval_episodes, deterministic=True
+    )
+
+    console.print("[green]Evaluation Results:[/green]")
+    console.print(f"  Mean Reward:   {mean_reward:+.4f} (+/- {std_reward:.4f})")
+
+    # Also run through EpisodeRunner for detailed metrics
+    agent = RLAgent(policy=trainer.model, position_limit=env.position_limit)
+    runner = EpisodeRunner(eval_env, agent)
+    results = runner.run(eval_episodes)
+    console.print(f"  Sharpe Ratio:  {sharpe_ratio(results):.4f}")
+    console.print(f"  Win Rate:      {win_rate(results):.1%}")
+    console.print(f"  Avg P&L:       {avg_pnl(results):+.6f}")
+    console.print(f"  Max Drawdown:  {max_drawdown(results):+.6f}")
 
 
 @cli.command()
@@ -337,6 +378,188 @@ def stats():
             console.print(f"  {cat or 'uncategorized'}: {count}")
     else:
         console.print("[dim]No data cached yet.[/dim]")
+
+
+@cli.command()
+@click.option("--agent", default="rule", help="Agent type: rule, claude, random, rl:<path>")
+@click.option("--markets", required=True, help="Comma-separated market IDs")
+@click.option("--mode", default="paper", type=click.Choice(["paper", "live", "dry-run"]))
+@click.option("--capital", default=100.0, help="Starting capital (USD)")
+@click.option("--interval", default=60, help="Seconds between ticks")
+@click.option("--max-ticks", default=0, help="Max ticks (0 = unlimited)")
+@click.option("--max-position", default=50.0, help="Max position size per market (USD)")
+@click.option("--max-exposure", default=200.0, help="Max total exposure (USD)")
+@click.option("--max-loss", default=100.0, help="Session kill switch loss (USD)")
+def live(
+    agent: str,
+    markets: str,
+    mode: str,
+    capital: float,
+    interval: int,
+    max_ticks: int,
+    max_position: float,
+    max_exposure: float,
+    max_loss: float,
+):
+    """Run an agent against live Polymarket data."""
+    import logging
+    from polymarket_playground.execution.risk_gate import RiskConfig
+    from polymarket_playground.markets.polymarket import PolymarketAdapter
+    from polymarket_playground.training.live_runner import LiveConfig, LiveRunner
+    from polymarket_playground.data.session_log import SessionLog
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+
+    market_ids = [m.strip() for m in markets.split(",") if m.strip()]
+    if not market_ids:
+        console.print("[red]No market IDs provided.[/red]")
+        return
+
+    agent_obj = _get_agent(agent)
+    adapter = PolymarketAdapter()
+
+    # Validate markets exist
+    console.print(f"[bold]Mode: {mode}[/bold]")
+    console.print(f"Agent: {type(agent_obj).__name__}")
+    console.print(f"Markets: {len(market_ids)}")
+    console.print(f"Capital: ${capital:.2f}")
+    console.print(f"Interval: {interval}s")
+    console.print()
+
+    for mid in market_ids:
+        try:
+            state = adapter.build_state(mid)
+            console.print(f"  [green]{mid}[/green]: {state.question[:60]}... YES={state.yes_price:.3f}")
+        except Exception as e:
+            console.print(f"  [red]{mid}[/red]: {e}")
+            return
+
+    # Build executor based on mode
+    if mode == "live":
+        from polymarket_playground.execution.live_executor import LiveExecutor
+        executor = LiveExecutor(max_slippage=0.02)
+        console.print("\n[bold red]LIVE MODE — real orders will be placed![/bold red]")
+        if not click.confirm("Continue?"):
+            return
+    else:
+        from polymarket_playground.execution.paper_executor import PaperExecutor
+        executor = PaperExecutor()
+
+    risk_config = RiskConfig(
+        max_position_usd=max_position,
+        max_total_exposure_usd=max_exposure,
+        max_loss_per_session_usd=max_loss,
+    )
+
+    config = LiveConfig(
+        market_ids=market_ids,
+        interval_seconds=interval,
+        starting_capital=capital,
+        risk=risk_config,
+        mode=mode,
+        max_ticks=max_ticks,
+    )
+
+    runner = LiveRunner(
+        agent=agent_obj,
+        executor=executor,
+        adapter=adapter,
+        config=config,
+        session_log=SessionLog(),
+    )
+
+    console.print("\n[bold green]Starting...[/bold green] (Ctrl+C to stop)\n")
+    summary = runner.run()
+
+    console.print("\n[bold]Session Summary:[/bold]")
+    console.print(f"  Ticks:              {summary['ticks']}")
+    console.print(f"  Total P&L:          {summary['total_pnl']:+.4f}")
+    console.print(f"  Final Capital:      ${summary['final_capital']:.2f}")
+    console.print(f"  Active Positions:   {summary['active_positions']}")
+    console.print(f"  Risk Interventions: {summary['risk_interventions']}")
+    if summary['kill_switch']:
+        console.print("  [red]Kill switch was triggered![/red]")
+
+
+@cli.command()
+@click.option("--limit", "n", default=20, help="Number of sessions to show")
+def sessions(n: int):
+    """List past live/paper trading sessions."""
+    from polymarket_playground.data.session_log import SessionLog
+    from datetime import datetime
+
+    log = SessionLog()
+    records = log.list_sessions(limit=n)
+
+    if not records:
+        console.print("[dim]No sessions recorded yet.[/dim]")
+        return
+
+    table = Table(title="Trading Sessions")
+    table.add_column("ID", style="cyan")
+    table.add_column("Agent")
+    table.add_column("Mode")
+    table.add_column("Started")
+    table.add_column("P&L", style="green")
+    table.add_column("Ticks")
+    table.add_column("Risk Blocks")
+
+    for r in records:
+        started = datetime.fromtimestamp(r.started_at).strftime("%Y-%m-%d %H:%M")
+        pnl = f"{r.total_pnl:+.4f}" if r.total_pnl is not None else "—"
+        table.add_row(
+            str(r.session_id),
+            r.agent_type,
+            r.mode,
+            started,
+            pnl,
+            str(r.total_ticks),
+            str(r.risk_interventions),
+        )
+
+    console.print(table)
+
+
+@cli.command(name="session-report")
+@click.argument("session_id", type=int)
+def session_report(session_id: int):
+    """Show detailed report for a trading session."""
+    from polymarket_playground.data.session_log import SessionLog
+    from datetime import datetime
+
+    log = SessionLog()
+    ticks = log.get_session_ticks(session_id)
+
+    if not ticks:
+        console.print(f"[red]No ticks found for session {session_id}.[/red]")
+        return
+
+    console.print(f"[bold]Session {session_id} — {len(ticks)} ticks[/bold]\n")
+
+    # Group by market
+    markets: dict[str, list] = {}
+    for t in ticks:
+        mid = t["market_id"]
+        if mid not in markets:
+            markets[mid] = []
+        markets[mid].append(t)
+
+    for mid, market_ticks in markets.items():
+        console.print(f"[cyan]Market: {mid}[/cyan]")
+        actions_taken = [t for t in market_ticks if t["action"] and t["action"] != "hold"]
+        risk_blocked = [t for t in market_ticks if t["risk_blocked"]]
+        console.print(f"  Ticks: {len(market_ticks)}, Actions: {len(actions_taken)}, Blocked: {len(risk_blocked)}")
+
+        for t in actions_taken[:10]:  # show first 10 actions
+            ts = datetime.fromtimestamp(t["timestamp"]).strftime("%H:%M:%S")
+            fill_info = ""
+            if t["fill_direction"]:
+                fill_info = f" -> fill {t['fill_direction']} {t['fill_size']:.2f}@{t['fill_price']:.4f}"
+            console.print(f"    [{ts}] {t['action']} size={t['action_size']:.2f}{fill_info}")
+
+        if len(actions_taken) > 10:
+            console.print(f"    ... and {len(actions_taken) - 10} more actions")
+        console.print()
 
 
 if __name__ == "__main__":

@@ -68,7 +68,10 @@ class ClaudeAgent(BaseAgent):
 
     Conversation history is maintained within an episode so Claude can reason
     about its own prior actions. History is cleared on ``on_reset()``.
+    A sliding window keeps token usage bounded.
     """
+
+    MAX_HISTORY_MESSAGES = 20  # keep last N messages to bound token usage
 
     def __init__(
         self,
@@ -83,23 +86,35 @@ class ClaudeAgent(BaseAgent):
             logger.warning("No ANTHROPIC_API_KEY found. ClaudeAgent will return hold actions.")
             self.client = None
         self.history: list[dict[str, str]] = []
-        self._position_yes: float = 0.0
-        self._position_no: float = 0.0
         self._step: int = 0
-        self._total_pnl: float = 0.0
+        self._cumulative_reward: float = 0.0
 
     def act(self, state: MarketState) -> Action:
         self._step += 1
         context = _build_context(state)
 
-        # Add position info
+        # Use actual position from the environment (not local tracking)
+        unrealized_pnl = (
+            state.agent_yes_shares * state.yes_price
+            + state.agent_no_shares * (1.0 - state.yes_price)
+            - state.agent_cost_basis
+        )
+        total_pnl = unrealized_pnl + state.agent_realized_pnl
         context += (
             f"\n--- Your Position (Step {self._step}) ---\n"
-            f"YES shares: {self._position_yes:.2f} | NO shares: {self._position_no:.2f}\n"
-            f"Running P&L: {self._total_pnl:.4f}\n"
+            f"YES shares: {state.agent_yes_shares:.2f} | "
+            f"NO shares: {state.agent_no_shares:.2f}\n"
+            f"Cost basis: {state.agent_cost_basis:.4f}\n"
+            f"Unrealized P&L: {unrealized_pnl:+.4f} | "
+            f"Realized P&L: {state.agent_realized_pnl:+.4f}\n"
+            f"Total P&L: {total_pnl:+.4f}\n"
         )
 
         self.history.append({"role": "user", "content": context})
+
+        # Sliding window to bound token usage
+        if len(self.history) > self.MAX_HISTORY_MESSAGES:
+            self.history = self.history[-self.MAX_HISTORY_MESSAGES:]
 
         if self.client is None:
             raw = '{"action": "hold", "size": 0.0, "reasoning": "no API key"}'
@@ -129,24 +144,12 @@ class ClaudeAgent(BaseAgent):
             action = Action(direction=0, size=0.0, reasoning="parse error fallback")
 
         self.history.append({"role": "assistant", "content": raw})
-
-        # Track position locally for context
-        if action.direction == 1:  # buy_yes
-            self._position_yes += action.size
-        elif action.direction == 2:  # buy_no
-            self._position_no += action.size
-        elif action.direction == 3:  # close
-            self._position_yes = 0.0
-            self._position_no = 0.0
-
         return action
 
     def on_reset(self, state: MarketState) -> None:
         self.history = []
-        self._position_yes = 0.0
-        self._position_no = 0.0
         self._step = 0
-        self._total_pnl = 0.0
+        self._cumulative_reward = 0.0
 
     def on_episode_end(self, result: EpisodeResult) -> None:
-        self._total_pnl = result.total_reward
+        self._cumulative_reward = result.total_reward

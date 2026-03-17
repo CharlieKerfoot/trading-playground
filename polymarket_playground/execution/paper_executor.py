@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from polymarket_playground.core.action import Action, DIRECTION_NAMES
+from polymarket_playground.core.position import Position
 from polymarket_playground.core.state import MarketState
 from polymarket_playground.core.types import Fill
 from polymarket_playground.execution.base_executor import BaseExecutor
@@ -17,7 +18,12 @@ class PaperExecutor(BaseExecutor):
         self.fee_rate: float = config.get("fee_rate", 0.02)
         self.slippage_model = SlippageModel()
 
-    def execute(self, action: Action, state: MarketState) -> Fill | None:
+    def execute(
+        self,
+        action: Action,
+        state: MarketState,
+        position: Position | None = None,
+    ) -> Fill | None:
         """Execute an action against current market state.
 
         Handles direction mapping:
@@ -32,7 +38,7 @@ class PaperExecutor(BaseExecutor):
             return None
 
         if direction_name == "close":
-            return self._close(action, state)
+            return self._close(action, state, position)
 
         # buy_yes or buy_no
         token_direction = "yes" if direction_name == "buy_yes" else "no"
@@ -54,14 +60,25 @@ class PaperExecutor(BaseExecutor):
             timestamp=state.timestamp,
         )
 
-    def _close(self, action: Action, state: MarketState) -> Fill:
+    def _close(
+        self,
+        action: Action,
+        state: MarketState,
+        position: Position | None = None,
+    ) -> Fill:
         """Close position at current prices.
 
-        Uses the YES price for closing — the caller (environment) tracks
-        the actual position and settles accordingly.
+        Sells back the shares the agent holds. Uses the correct side
+        (YES or NO) based on the actual position, or falls back to
+        YES-side pricing when position info isn't available.
         """
+        # Determine which side to sell based on the actual position
+        sell_side = "close_yes"
+        if position and position.no_shares > position.yes_shares:
+            sell_side = "close_no"
+
         fill_price, spread_capture = self.slippage_model.simulate_fill(
-            "yes", action.size, state
+            sell_side, action.size, state
         )
         fees = fill_price * action.size * self.fee_rate
 

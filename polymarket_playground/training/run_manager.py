@@ -85,11 +85,32 @@ class TrainingRun:
 
 
 class RunManager:
-    """Manages training runs: create, start, cancel, list."""
+    """Manages training runs: create, start, cancel, list.
+
+    Persists completed run metadata to EpisodeStore so results survive
+    server restarts.
+    """
 
     def __init__(self) -> None:
         self._runs: dict[str, TrainingRun] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+
+        # Load previously persisted runs
+        try:
+            from polymarket_playground.data.episode_store import EpisodeStore
+            self._store = EpisodeStore()
+            for row in self._store.load_runs():
+                run = TrainingRun(
+                    id=row["id"],
+                    agent_type=row["agent_type"],
+                    num_episodes=row["num_episodes"],
+                    status=RunStatus(row["status"]),
+                )
+                self._runs[run.id] = run
+        except Exception as e:
+            logger.debug("Could not load persisted runs: %s", e)
+            from polymarket_playground.data.episode_store import EpisodeStore
+            self._store = EpisodeStore()
 
     def create_run(
         self,
@@ -156,6 +177,7 @@ class RunManager:
                 logger.exception("Run %s failed", run_id)
             finally:
                 run.finished_at = time.time()
+                self._persist_run(run)
 
         task = asyncio.create_task(_execute())
         self._tasks[run_id] = task
@@ -180,6 +202,23 @@ class RunManager:
     def delete_run(self, run_id: str) -> bool:
         self.cancel_run(run_id)
         return self._runs.pop(run_id, None) is not None
+
+    def _persist_run(self, run: TrainingRun) -> None:
+        """Save run metadata to persistent storage."""
+        try:
+            self._store.save_run({
+                "id": run.id,
+                "agent_type": run.agent_type,
+                "agent_config": run.agent_config,
+                "num_episodes": run.num_episodes,
+                "status": run.status.value,
+                "created_at": str(run.created_at),
+                "started_at": str(run.started_at) if run.started_at else None,
+                "finished_at": str(run.finished_at) if run.finished_at else None,
+                "error": run.error,
+            })
+        except Exception as e:
+            logger.warning("Failed to persist run %s: %s", run.id, e)
 
     @staticmethod
     def _make_agent(agent_type: str, config: dict, env: TradingEnv):

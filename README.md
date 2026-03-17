@@ -9,86 +9,71 @@ Agent-agnostic, market-agnostic training environment for prediction market agent
 uv sync
 cd web && npm install && cd ..
 
-# Sync resolved markets from Polymarket
-uv run python cli.py sync --limit 100
+# Sync resolved markets from Polymarket (more = better training data)
+uv run python main.py sync --limit 200
 
-# Launch the web interface (opens browser automatically)
-uv run python cli.py serve
+# Train an RL agent (PPO with 100k timesteps, ~30 seconds)
+uv run python main.py train-rl --timesteps 100000
 
-# Or run an agent from the CLI
-uv run python cli.py run --agent rule --episodes 50
+# Compare agents head-to-head
+uv run python main.py compare --agents rule --agents random --episodes 50
+
+# Or launch the web interface
+uv run python main.py serve
+```
+
+## Training Pipeline
+
+### 1. Sync market data
+
+Download resolved prediction markets from Polymarket. Only markets with clear outcomes (YES/NO resolution) are used for training.
+
+```bash
+uv run python main.py sync --limit 500
+```
+
+### 2. Train an RL agent
+
+Train a PPO or A2C agent with Stable-Baselines3. Includes automatic observation normalization (VecNormalize), periodic evaluation callbacks, and trained model persistence.
+
+```bash
+uv run python main.py train-rl \
+  --timesteps 100000 \
+  --algorithm PPO \
+  --save-path models/my_agent
+```
+
+### 3. Evaluate and compare
+
+```bash
+# Run any agent type
+uv run python main.py train --agent rule --episodes 100
+
+# Head-to-head comparison on identical seeded episodes
+uv run python main.py compare \
+  --agents rule --agents random --agents rl:models/ppo_agent \
+  --episodes 100
 ```
 
 ## Web Interface
 
-The web dashboard starts with `cli.py serve`. It launches both the FastAPI backend and the SvelteKit frontend, then opens your browser.
+Launch both the FastAPI backend and SvelteKit frontend with `main.py serve`.
 
-**Pages:**
-
-- **Dashboard** (`/`) — Overview stats (total markets, price points, categories, runs) and recent training runs
-- **Data** (`/data`) — Sync resolved Polymarket markets into the local SQLite cache, view category breakdowns
-- **Train** (`/train`) — Configure and launch training runs: pick an agent, set parameters, choose episode count and category filter
-- **Runs** (`/runs`) — Browse all training runs, click into any run for live WebSocket progress, episode-by-episode rewards, and final metrics (Sharpe, win rate, P&L, max drawdown)
-
-### Manual startup
-
-If you prefer to start the servers separately:
-
-```bash
-# Terminal 1 — backend
-uv run uvicorn polymarket_playground.server:app --port 8000
-
-# Terminal 2 — frontend
-cd web && npm run dev
-```
+- **Dashboard** (`/`) — Overview stats and recent runs
+- **Data** (`/data`) — Sync markets, view category breakdowns
+- **Train** (`/train`) — Configure and launch training runs
+- **Runs** (`/runs`) — Live WebSocket progress, episode rewards, metrics
 
 ## CLI Commands
 
-### `serve` — Launch the web UI
-
-```bash
-uv run python cli.py serve [--host 0.0.0.0] [--port 8000]
-```
-
-### `sync` — Download market data
-
-```bash
-uv run python cli.py sync --limit 100 [--category btc]
-```
-
-### `run` — Run an agent
-
-```bash
-uv run python cli.py run \
-  --agent rule \        # rule | claude | rl | random | rl:path/to/model
-  --episodes 50 \
-  --category btc        # optional: filter markets by category
-```
-
-### `train` — Train an RL agent
-
-```bash
-uv run python cli.py train \
-  --timesteps 100000 \
-  --algorithm PPO \       # PPO | A2C
-  --category btc \
-  --save-path models/my_model
-```
-
-### `compare` — Head-to-head agent comparison
-
-```bash
-uv run python cli.py compare \
-  --agents rule --agents random \
-  --episodes 50 \
-  --category btc
-```
-
-### `stats` — Show cached data statistics
-
-```bash
-uv run python cli.py stats
-```
+| Command | Description |
+|---------|-------------|
+| `sync` | Download resolved markets from Polymarket |
+| `train` | Run episode-based training (rule, claude, rl, random) |
+| `train-rl` | Train RL agent with SB3 (PPO/A2C) + evaluation |
+| `compare` | Head-to-head comparison on identical episodes |
+| `stats` | Show cached data statistics |
+| `serve` | Launch web UI (API + frontend) |
 
 ## Architecture
 
@@ -96,71 +81,47 @@ uv run python cli.py stats
 polymarket_playground/
 ├── core/           # TradingEnv, MarketState, Action, Position
 ├── agents/         # Claude, RL, rule-based agents
-├── markets/        # Pluggable market adapters (Polymarket)
 ├── data/           # Polymarket client, SQLite cache, historical replay
 ├── execution/      # Paper executor with slippage model
 ├── eval/           # Episode runner, metrics, comparison, RL training
 ├── training/       # Run manager for batch training
-├── config/         # YAML configs for environment parameters
 └── server.py       # FastAPI + WebSocket backend
 
 web/                # SvelteKit frontend (Svelte 5 + TypeScript)
-├── src/
-│   ├── lib/
-│   │   ├── api.ts          # TypeScript API client
-│   │   └── components/     # MetricsCard, RunsTable, AgentConfigurator, etc.
-│   └── routes/
-│       ├── +page.svelte    # Dashboard
-│       ├── data/           # Data sync & management
-│       ├── train/          # Training configuration
-│       └── runs/           # Run listing & detail views
-└── vite.config.ts          # Vite proxy to FastAPI backend
 ```
 
-### Design Principles
+### Reward Design
 
-1. **Agent-agnostic** — All agents implement `BaseAgent.act(state) -> Action`. Claude, RL policies, and rule-based bots share the same interface.
-2. **Market-agnostic** — Market-specific logic lives in swappable `MarketAdapter` plugins. Adding a new market = one file in `markets/`.
-3. **Training-focused** — Historical replay with paper execution. No live trading — all agents train and evaluate against resolved market data.
+The environment uses a combination of per-step and terminal rewards:
+
+- **Per-step**: Mark-to-market P&L changes, spread capture, minus transaction fees
+- **Terminal (resolution)**: Full settlement P&L — the difference between position value at resolution vs current market value
+
+This gives the RL agent both a dense learning signal (don't overtrade, manage fees) and the critical sparse signal (predict the resolution correctly).
 
 ### Key Abstractions
 
 | Abstraction | Role |
 |-------------|------|
-| `MarketState` | Universal market snapshot: prices, spreads, book depth, time, external signals |
-| `MarketAdapter` | Pluggable market logic — fetches signals and builds agent context |
-| `TradingEnv` | Gymnasium-compatible environment with configurable fees, position limits, and step count |
+| `MarketState` | Universal market snapshot: prices, spreads, book depth, time, signals |
+| `TradingEnv` | Gymnasium environment with fees, position limits, settlement |
 | `BaseAgent` | Agent interface: `act(state) -> Action` |
-| `PaperExecutor` | Simulated fills with configurable slippage model |
+| `PaperExecutor` | Simulated fills with quadratic slippage model |
 
 ## Agents
 
 | Agent | Description |
 |-------|-------------|
-| `rule` | Deterministic baseline — buys YES below 0.3, NO above 0.7 |
+| `rule` | Threshold-based baseline — buys YES below 0.35, NO above 0.65 |
 | `claude` | Claude API agent with multi-turn conversation history per episode |
-| `rl` | SB3-compatible RL policy wrapper (load trained model with `rl:path/to/model`) |
-| `random` | Random actions (RL agent with no policy) |
-
-## Markets
-
-Resolved markets synced from Polymarket's public API into a local SQLite cache. No API key required.
-
-| Signal | Description |
-|--------|-------------|
-| `best_bid` / `best_ask` | Top-of-book prices from CLOB orderbook |
-| `spread` | Bid-ask spread |
-| `book_depth_bid` / `book_depth_ask` | Total size at top 5 price levels |
-| `last_trade_price` | Most recent trade |
-| `volume_24hr` | 24-hour trading volume (USDC) |
-| `liquidity` | Available liquidity |
+| `rl` | SB3 RL policy wrapper (load trained model with `rl:path/to/model`) |
+| `random` | Random actions baseline |
 
 ## Configuration
 
-YAML configs in `polymarket_playground/config/` control environment parameters:
+Environment parameters in `polymarket_playground/config/base.yaml`:
 
 ```yaml
-# base.yaml — defaults
 env:
   max_steps: 50
   position_limit: 10.0
@@ -169,11 +130,7 @@ env:
 
 ## Claude Agent Setup
 
-The Claude agent requires an Anthropic API key:
-
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-uv run python cli.py run --agent claude --episodes 5
+uv run python main.py train --agent claude --episodes 5
 ```
-
-Without the key, the agent degrades gracefully (holds every step).

@@ -21,10 +21,13 @@ class RLAgent(BaseAgent):
     baseline or for smoke-testing the environment loop.
     """
 
-    def __init__(self, policy: object | None = None) -> None:
+    def __init__(
+        self,
+        policy: object | None = None,
+        position_limit: float = 10.0,
+    ) -> None:
         self.policy = policy
-        self._yes_shares: float = 0.0
-        self._no_shares: float = 0.0
+        self.position_limit = position_limit
 
     # ------------------------------------------------------------------
     # BaseAgent interface
@@ -34,44 +37,37 @@ class RLAgent(BaseAgent):
         obs = self._build_obs(state)
 
         if self.policy is None:
-            direction = random.randint(0, 2)  # hold / buy_yes / buy_no
+            direction = random.randint(0, 3)  # hold / buy_yes / buy_no / close
             size = random.random()
-            action = Action(direction=direction, size=size, reasoning="random")
+            return Action(direction=direction, size=size, reasoning="random")
+
+        raw_action, _ = self.policy.predict(obs, deterministic=True)
+        if hasattr(raw_action, "__getitem__"):
+            direction = int(raw_action[0]) if len(raw_action) > 0 else 0
+            size_bucket = int(raw_action[1]) if len(raw_action) > 1 else 5
+            size = size_bucket / 9.0
         else:
-            raw_action, _ = self.policy.predict(obs, deterministic=True)
-            if hasattr(raw_action, "__getitem__"):
-                direction = int(raw_action[0]) if len(raw_action) > 0 else 0
-                size_bucket = int(raw_action[1]) if len(raw_action) > 1 else 5
-                size = size_bucket / 9.0
-            else:
-                direction = int(raw_action)
-                size = 0.5
-            action = Action(direction=direction, size=size, reasoning="rl_policy")
-
-        # Track position locally
-        if action.direction == 1:
-            self._yes_shares += action.size
-        elif action.direction == 2:
-            self._no_shares += action.size
-        elif action.direction == 3:
-            self._yes_shares = 0.0
-            self._no_shares = 0.0
-
-        return action
+            direction = int(raw_action)
+            size = 0.5
+        return Action(direction=direction, size=size, reasoning="rl_policy")
 
     def _build_obs(self, state: MarketState) -> np.ndarray:
-        """Build observation matching TradingEnv's obs space (market + position)."""
+        """Build observation matching TradingEnv's obs space (market + position).
+
+        Uses actual position from MarketState (populated by env) instead of
+        local tracking, so observations stay consistent with the environment.
+        """
         market_obs = ObservationBuilder.flatten(state)
+        pos_limit = self.position_limit
         position_obs = np.array([
-            self._yes_shares,
-            self._no_shares,
-            self._yes_shares - self._no_shares,
+            state.agent_yes_shares / pos_limit,
+            state.agent_no_shares / pos_limit,
+            (state.agent_yes_shares - state.agent_no_shares) / pos_limit,
         ], dtype=np.float32)
         return np.concatenate([market_obs, position_obs])
 
     def on_reset(self, state: MarketState) -> None:
-        self._yes_shares = 0.0
-        self._no_shares = 0.0
+        pass
 
     def on_episode_end(self, result: EpisodeResult) -> None:
         pass

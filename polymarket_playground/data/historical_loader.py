@@ -45,17 +45,31 @@ class HistoricalLoader:
         self._refresh_market_list()
 
     def _refresh_market_list(self) -> None:
-        """Refresh the list of available markets from cache."""
+        """Refresh the list of available markets from cache.
+
+        Only includes markets with known outcomes (resolution value),
+        since markets without outcomes provide no learning signal.
+        """
         markets = self.cache.get_markets()
-        self._market_ids = [m["id"] for m in markets]
+        self._market_ids = [
+            m["id"] for m in markets if m.get("outcome") is not None
+        ]
         logger.info(
-            "Historical loader: %d markets available",
+            "Historical loader: %d markets available (of %d total)",
             len(self._market_ids),
+            len(markets),
         )
 
     def set_market_filter(self, category: str) -> None:
-        """Filter markets to a specific category."""
-        self._market_ids = self.cache.get_market_ids_by_category(category)
+        """Filter markets to a specific category (only those with outcomes)."""
+        all_ids = set(self.cache.get_market_ids_by_category(category))
+        # Only keep markets with known outcomes
+        markets = self.cache.get_markets()
+        outcome_ids = {
+            m["id"] for m in markets
+            if m.get("outcome") is not None and m["id"] in all_ids
+        }
+        self._market_ids = list(outcome_ids)
         logger.info(
             "Filtered to category '%s': %d markets",
             category,

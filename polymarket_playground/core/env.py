@@ -41,11 +41,12 @@ class TradingEnv(gym.Env):
         self.data = HistoricalLoader(cache, max_steps=max_steps)
         self.position: Position | None = None
         self.state: MarketState | None = None
+        self._total_fees: float = 0.0
 
         # Observation: 10 base + 8 signals + 3 position features
         n_features = 10 + 8 + 3
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(n_features,), dtype=np.float32
+            low=-10.0, high=10.0, shape=(n_features,), dtype=np.float32
         )
         self.action_space = spaces.Dict(
             {
@@ -58,6 +59,8 @@ class TradingEnv(gym.Env):
         super().reset(seed=seed)
         self.state = self.data.next_episode()
         self.position = Position()
+        self._total_fees = 0.0
+        self._sync_position_to_state()
         return self._obs(), {}
 
     def step(self, action: Action | dict):
@@ -88,29 +91,46 @@ class TradingEnv(gym.Env):
             if action.size <= 0:
                 action = Action(direction=0, size=0.0)  # treat as hold
 
-        fill = self.executor.execute(action, self.state)
+        fill = self.executor.execute(action, self.state, self.position)
         self.position.update(fill)
         self.state = self.data.advance()
+        self._sync_position_to_state()
+
+        # Track cumulative fees for info
+        if fill:
+            self._total_fees += fill.fees
 
         reward = self._reward(fill)
         terminated = self.state.is_resolved
-        truncated = self.data.is_truncated()
+        truncated = not terminated and self.data.is_truncated()
 
         if terminated:
-            reward += self.position.settlement_pnl(self.state.resolution)
-        elif truncated:
-            # Close-out P&L at current market price so RL gets a signal
-            reward += self.position.close_value(self.state.yes_price) - self.position.cost_basis
+            # Settlement reward: the full P&L from resolution.
+            # settlement_pnl accounts for cost basis and gives the actual
+            # profit/loss from holding through to resolution.
+            reward += self.position.settlement_pnl(self.state.resolution) - (
+                self.position.close_value(self.state.yes_price)
+                - self.position.cost_basis
+            )
 
         return self._obs(), reward, terminated, truncated, self._info(fill)
+
+    def _sync_position_to_state(self) -> None:
+        """Copy actual position into MarketState so agents can see it."""
+        self.state.agent_yes_shares = self.position.yes_shares
+        self.state.agent_no_shares = self.position.no_shares
+        self.state.agent_cost_basis = self.position.cost_basis
+        self.state.agent_realized_pnl = self.position.realized_pnl
 
     def _obs(self) -> np.ndarray:
         """Flatten MarketState + position into a fixed-size float vector."""
         market_obs = ObservationBuilder.flatten(self.state)
+        # Normalize position features to ~[0, 1] range
+        pos_limit = self.position_limit
         position_obs = np.array([
-            self.position.yes_shares,
-            self.position.no_shares,
-            self.position.net_exposure,
+            self.position.yes_shares / pos_limit,
+            self.position.no_shares / pos_limit,
+            self.position.net_exposure / pos_limit,
         ], dtype=np.float32)
         return np.concatenate([market_obs, position_obs])
 
@@ -127,11 +147,19 @@ class TradingEnv(gym.Env):
                 "yes_shares": self.position.yes_shares,
                 "no_shares": self.position.no_shares,
                 "net_exposure": self.position.net_exposure,
+                "cost_basis": self.position.cost_basis,
+                "realized_pnl": self.position.realized_pnl,
             },
             "state": {
                 "yes_price": self.state.yes_price,
                 "time_elapsed": self.state.time_elapsed,
                 "is_resolved": self.state.is_resolved,
+            },
+            "fill": {
+                "direction": fill.direction if fill else None,
+                "size": fill.size if fill else 0.0,
+                "price": fill.price if fill else 0.0,
+                "fees": fill.fees if fill else 0.0,
             },
             "spread_capture": fill.spread_capture if fill else 0.0,
         }
