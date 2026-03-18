@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass, field
 
 from polymarket_playground.agents.base_agent import BaseAgent
-from polymarket_playground.core.action import Action
 from polymarket_playground.core.portfolio import Portfolio
 from polymarket_playground.data.session_log import SessionLog
 from polymarket_playground.execution.base_executor import BaseExecutor

@@ -1,6 +1,6 @@
 """Tests for the shared Claude helper."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from polymarket_playground.agents.claude_helper import (
     call_claude,

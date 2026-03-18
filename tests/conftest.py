@@ -1,7 +1,6 @@
 """Shared fixtures for the test suite."""
 
 import json
-import sqlite3
 
 import pytest
 

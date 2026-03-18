@@ -1,7 +1,5 @@
 """Tests for statistical validation and walk-forward backtesting."""
 
-import math
-
 from polymarket_playground.core.types import EpisodeResult
 from polymarket_playground.eval.metrics import (
     ValidationResult,

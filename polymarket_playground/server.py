@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from polymarket_playground.core.env import TradingEnv
 from polymarket_playground.data.market_cache import MarketCache
-from polymarket_playground.training.run_manager import RunManager, RunStatus, TrainingRun
+from polymarket_playground.training.run_manager import RunManager, TrainingRun
 
 logger = logging.getLogger(__name__)
 

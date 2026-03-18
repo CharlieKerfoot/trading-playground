@@ -1,6 +1,5 @@
 """Tests for walk-forward backtesting (date-based market splits)."""
 
-import sqlite3
 import tempfile
 from pathlib import Path
 

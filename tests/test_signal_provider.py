@@ -1,7 +1,6 @@
 """Tests for signal providers."""
 
 import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 from polymarket_playground.data.signal_provider import (
