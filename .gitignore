@@ -1,1 +1,7 @@
 models/
+__pycache__
+episodes.db
+
+# Internal CC Configs
+PLAN.md
+TODOS.md

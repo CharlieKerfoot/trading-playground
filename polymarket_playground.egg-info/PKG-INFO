@@ -1,0 +1,156 @@
+Metadata-Version: 2.4
+Name: polymarket-playground
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: aiohttp>=3.13.3
+Requires-Dist: anthropic>=0.84.0
+Requires-Dist: click>=8.3.1
+Requires-Dist: fastapi>=0.135.1
+Requires-Dist: gymnasium>=1.2.3
+Requires-Dist: numpy>=2.4.3
+Requires-Dist: pandas>=3.0.1
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: requests>=2.32.5
+Requires-Dist: rich>=14.3.3
+Requires-Dist: stable-baselines3>=2.7.1
+Requires-Dist: uvicorn>=0.41.0
+Requires-Dist: websockets>=16.0
+
+# Trading Playground
+
+Agent-agnostic, market-agnostic training environment for prediction market agents. Uses **real Polymarket data** — historical prices, orderbooks, and signals from the Gamma and CLOB APIs. Plug in Claude, RL policies, or rule-based bots — all against the same Gymnasium-compatible environment.
+
+## Quick Start
+
+```bash
+# Install dependencies
+uv sync
+cd web && npm install && cd ..
+
+# Sync resolved markets from Polymarket (more = better training data)
+uv run python main.py sync --limit 200
+
+# Train an RL agent (PPO with 100k timesteps, ~30 seconds)
+uv run python main.py train-rl --timesteps 100000
+
+# Compare agents head-to-head
+uv run python main.py compare --agents rule --agents random --episodes 50
+
+# Or launch the web interface
+uv run python main.py serve
+```
+
+## Training Pipeline
+
+### 1. Sync market data
+
+Download resolved prediction markets from Polymarket. Only markets with clear outcomes (YES/NO resolution) are used for training.
+
+```bash
+uv run python main.py sync --limit 500
+```
+
+### 2. Train an RL agent
+
+Train a PPO or A2C agent with Stable-Baselines3. Includes automatic observation normalization (VecNormalize), periodic evaluation callbacks, and trained model persistence.
+
+```bash
+uv run python main.py train-rl \
+  --timesteps 100000 \
+  --algorithm PPO \
+  --save-path models/my_agent
+```
+
+### 3. Evaluate and compare
+
+```bash
+# Run any agent type
+uv run python main.py train --agent rule --episodes 100
+
+# Head-to-head comparison on identical seeded episodes
+uv run python main.py compare \
+  --agents rule --agents random --agents rl:models/ppo_agent \
+  --episodes 100
+```
+
+## Web Interface
+
+Launch both the FastAPI backend and SvelteKit frontend with `main.py serve`.
+
+- **Dashboard** (`/`) — Overview stats and recent runs
+- **Data** (`/data`) — Sync markets, view category breakdowns
+- **Train** (`/train`) — Configure and launch training runs
+- **Runs** (`/runs`) — Live WebSocket progress, episode rewards, metrics
+
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `sync` | Download resolved markets from Polymarket |
+| `train` | Run episode-based training (rule, claude, rl, random) |
+| `train-rl` | Train RL agent with SB3 (PPO/A2C) + evaluation |
+| `compare` | Head-to-head comparison on identical episodes |
+| `stats` | Show cached data statistics |
+| `serve` | Launch web UI (API + frontend) |
+
+## Architecture
+
+```
+polymarket_playground/
+├── core/           # TradingEnv, MarketState, Action, Position
+├── agents/         # Claude, RL, rule-based agents
+├── data/           # Polymarket client, SQLite cache, historical replay
+├── execution/      # Paper executor with slippage model
+├── eval/           # Episode runner, metrics, comparison, RL training
+├── training/       # Run manager for batch training
+└── server.py       # FastAPI + WebSocket backend
+
+web/                # SvelteKit frontend (Svelte 5 + TypeScript)
+```
+
+### Reward Design
+
+The environment uses a combination of per-step and terminal rewards:
+
+- **Per-step**: Mark-to-market P&L changes, spread capture, minus transaction fees
+- **Terminal (resolution)**: Full settlement P&L — the difference between position value at resolution vs current market value
+
+This gives the RL agent both a dense learning signal (don't overtrade, manage fees) and the critical sparse signal (predict the resolution correctly).
+
+### Key Abstractions
+
+| Abstraction | Role |
+|-------------|------|
+| `MarketState` | Universal market snapshot: prices, spreads, book depth, time, signals |
+| `TradingEnv` | Gymnasium environment with fees, position limits, settlement |
+| `BaseAgent` | Agent interface: `act(state) -> Action` |
+| `PaperExecutor` | Simulated fills with quadratic slippage model |
+
+## Agents
+
+| Agent | Description |
+|-------|-------------|
+| `rule` | Threshold-based baseline — buys YES below 0.35, NO above 0.65 |
+| `claude` | Claude API agent with multi-turn conversation history per episode |
+| `rl` | SB3 RL policy wrapper (load trained model with `rl:path/to/model`) |
+| `random` | Random actions baseline |
+
+## Configuration
+
+Environment parameters in `polymarket_playground/config/base.yaml`:
+
+```yaml
+env:
+  max_steps: 50
+  position_limit: 10.0
+  fee_rate: 0.02
+```
+
+## Claude Agent Setup
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+uv run python main.py train --agent claude --episodes 5
+```
