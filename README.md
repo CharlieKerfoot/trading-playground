@@ -2,6 +2,8 @@
 
 Agent-agnostic, market-agnostic training environment for prediction market agents. Uses **real Polymarket data** — historical prices, orderbooks, and signals from the Gamma and CLOB APIs. Plug in Claude, RL policies, or rule-based bots — all against the same Gymnasium-compatible environment.
 
+Includes an **end-to-end pipeline** from data sync to deployment recommendation: information signal analysis, walk-forward backtesting with temporal train/test splits, statistical validation, and a Claude learning loop that improves across training batches.
+
 ## Quick Start
 
 ```bash
@@ -12,13 +14,16 @@ cd web && npm install && cd ..
 # Sync resolved markets from Polymarket (more = better training data)
 uv run python main.py sync --limit 200
 
-# Train an RL agent (PPO with 100k timesteps, ~30 seconds)
-uv run python main.py train-rl --timesteps 100000
+# Run the full pipeline: sync → split → train → validate → rank → recommend
+uv run python main.py pipeline --signals
+
+# Or train a single agent
+uv run python main.py train --agent rule --episodes 100 --signals
 
 # Compare agents head-to-head
 uv run python main.py compare --agents rule --agents random --episodes 50
 
-# Or launch the web interface
+# Launch the web interface
 uv run python main.py serve
 ```
 
@@ -32,7 +37,29 @@ Download resolved prediction markets from Polymarket. Only markets with clear ou
 uv run python main.py sync --limit 500
 ```
 
-### 2. Train an RL agent
+### 2. End-to-end pipeline
+
+The `pipeline` command runs the full workflow: sync markets, create temporal train/test splits, train all agents, validate with statistical tests, compare against a random baseline, and rank strategies with deploy/skip recommendations.
+
+```bash
+uv run python main.py pipeline \
+  --agents rule --agents claude \
+  --episodes 100 \
+  --signals
+```
+
+### 3. Train with learning loop
+
+The Claude agent can learn across training batches via persistent strategy memory. After each batch, wins/losses/patterns are summarized and injected into future episodes.
+
+```bash
+uv run python main.py train-with-memory \
+  --batches 5 \
+  --episodes 50 \
+  --signals
+```
+
+### 4. Train an RL agent
 
 Train a PPO or A2C agent with Stable-Baselines3. Includes automatic observation normalization (VecNormalize), periodic evaluation callbacks, and trained model persistence.
 
@@ -43,7 +70,7 @@ uv run python main.py train-rl \
   --save-path models/my_agent
 ```
 
-### 3. Evaluate and compare
+### 5. Evaluate and compare
 
 ```bash
 # Run any agent type
@@ -53,7 +80,30 @@ uv run python main.py train --agent rule --episodes 100
 uv run python main.py compare \
   --agents rule --agents random --agents rl:models/ppo_agent \
   --episodes 100
+
+# Replay a single episode with price chart, trades, P&L, and reasoning
+uv run python main.py replay --agent claude --signals
 ```
+
+## Information Signals
+
+The `--signals` flag enables Claude-powered signal analysis that enriches each market with structured features beyond raw price data:
+
+- **Historical mode** (training): Claude analyzes the market question and price pattern. Produces `market_category_score`, `resolution_clarity`, `sentiment_score`, `volatility_expectation`, `information_density`. Results are SQLite-cached per market.
+- **Live mode** (trading): Web search (Tavily) + Claude analysis for real-time information edge. Produces `sentiment_score`, `information_edge`, `news_recency`, `signal_confidence`. TTL-cached (5 min default).
+
+Signal analysis uses `claude-haiku-4-5` to keep costs low (~10x cheaper than Sonnet).
+
+## Statistical Validation
+
+No capital should be deployed on a strategy that isn't statistically validated. The pipeline includes:
+
+- **t-test** on returns vs. zero (is the mean return significantly positive?)
+- **Bootstrap confidence intervals** on Sharpe ratio (10,000 samples)
+- **Comparison vs. random baseline** (two-sample t-test)
+- **Minimum sample requirements** (default: 30 episodes)
+
+The `pipeline` command outputs a ranking table with DEPLOY/SKIP recommendations based on statistical significance and outperformance vs. random.
 
 ## Web Interface
 
@@ -71,8 +121,14 @@ Launch both the FastAPI backend and SvelteKit frontend with `main.py serve`.
 | `sync` | Download resolved markets from Polymarket |
 | `train` | Run episode-based training (rule, claude, rl, random) |
 | `train-rl` | Train RL agent with SB3 (PPO/A2C) + evaluation |
+| `train-with-memory` | Train Claude with learning loop across batches |
 | `compare` | Head-to-head comparison on identical episodes |
+| `pipeline` | End-to-end: sync → split → train → validate → rank → recommend |
+| `replay` | Replay episode with price chart, trades, P&L, reasoning |
+| `live` | Run agent against live Polymarket data (paper/live/dry-run) |
 | `stats` | Show cached data statistics |
+| `sessions` | List past trading sessions |
+| `session-report` | Detailed report for a trading session |
 | `serve` | Launch web UI (API + frontend) |
 
 ## Architecture
@@ -80,11 +136,11 @@ Launch both the FastAPI backend and SvelteKit frontend with `main.py serve`.
 ```
 polymarket_playground/
 ├── core/           # TradingEnv, MarketState, Action, Position
-├── agents/         # Claude, RL, rule-based agents
-├── data/           # Polymarket client, SQLite cache, historical replay
-├── execution/      # Paper executor with slippage model
-├── eval/           # Episode runner, metrics, comparison, RL training
-├── training/       # Run manager for batch training
+├── agents/         # Claude, RL, rule-based agents + strategy memory
+├── data/           # Polymarket client, SQLite cache, signal providers
+├── execution/      # Paper + live executors with slippage model
+├── eval/           # Episode runner, metrics, validation, RL training
+├── training/       # Run manager, live trading loop
 └── server.py       # FastAPI + WebSocket backend
 
 web/                # SvelteKit frontend (Svelte 5 + TypeScript)
@@ -106,14 +162,17 @@ This gives the RL agent both a dense learning signal (don't overtrade, manage fe
 | `MarketState` | Universal market snapshot: prices, spreads, book depth, time, signals |
 | `TradingEnv` | Gymnasium environment with fees, position limits, settlement |
 | `BaseAgent` | Agent interface: `act(state) -> Action` |
+| `SignalProvider` | ABC for enriching markets with information signals |
+| `StrategyMemory` | Persistent learning across training batches |
 | `PaperExecutor` | Simulated fills with quadratic slippage model |
+| `ValidationResult` | Statistical validation: t-test, Sharpe CI, significance |
 
 ## Agents
 
 | Agent | Description |
 |-------|-------------|
 | `rule` | Threshold-based baseline — buys YES below 0.35, NO above 0.65 |
-| `claude` | Claude API agent with multi-turn conversation history per episode |
+| `claude` | Claude API agent with multi-turn history, strategy memory, signal awareness |
 | `rl` | SB3 RL policy wrapper (load trained model with `rl:path/to/model`) |
 | `random` | Random actions baseline |
 
@@ -128,9 +187,19 @@ env:
   fee_rate: 0.02
 ```
 
-## Claude Agent Setup
+## Setup
 
 ```bash
+# Core dependencies
+uv sync
+
+# Optional: live trading support
+uv sync --extra live
+
+# Optional: web search signals (requires TAVILY_API_KEY)
+uv sync --extra signals
+
+# Claude agent (requires ANTHROPIC_API_KEY)
 export ANTHROPIC_API_KEY="sk-ant-..."
-uv run python main.py train --agent claude --episodes 5
+uv run python main.py train --agent claude --episodes 5 --signals
 ```

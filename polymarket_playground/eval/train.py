@@ -206,7 +206,7 @@ class RLTrainer:
         from stable_baselines3.common.callbacks import EvalCallback
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-        # Create a separate eval env with matching normalization
+        # Create a separate eval env sharing normalization stats from training
         eval_wrapped = GymWrapper(self.wrapped_env.env)
         eval_vec = DummyVecEnv([lambda: eval_wrapped])
         eval_vec = VecNormalize(
@@ -217,6 +217,9 @@ class RLTrainer:
             gamma=0.995,
             training=False,
         )
+        # Sync running stats so eval observations are normalized identically
+        eval_vec.obs_rms = self.vec_env.obs_rms
+        eval_vec.ret_rms = self.vec_env.ret_rms
 
         eval_callback = EvalCallback(
             eval_vec,

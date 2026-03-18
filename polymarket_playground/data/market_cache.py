@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 from polymarket_playground.data.polymarket_client import PolymarketClient
@@ -46,6 +47,7 @@ class MarketCache:
 
     def __init__(self, db_path: str | Path = "market_data.db") -> None:
         self.db_path = Path(db_path)
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(self._CREATE_MARKETS)
@@ -218,25 +220,26 @@ class MarketCache:
                 # Extract category
                 cat = self._extract_category(m)
 
-                # Store market
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO markets (id, question, outcome, volume, metadata, category) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        market_id,
-                        m.get("question", ""),
-                        outcome,
-                        float(m.get("volume", 0) or 0),
-                        json.dumps(m, default=str),
-                        cat,
-                    ),
-                )
+                with self._lock:
+                    # Store market
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO markets (id, question, outcome, volume, metadata, category) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            market_id,
+                            m.get("question", ""),
+                            outcome,
+                            float(m.get("volume", 0) or 0),
+                            json.dumps(m, default=str),
+                            cat,
+                        ),
+                    )
 
-                # Store price history
-                self._conn.executemany(
-                    "INSERT INTO price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
-                    [(market_id, int(h["t"]), float(h["p"])) for h in history],
-                )
+                    # Store price history
+                    self._conn.executemany(
+                        "INSERT INTO price_history (market_id, timestamp, price) VALUES (?, ?, ?)",
+                        [(market_id, int(h["t"]), float(h["p"])) for h in history],
+                    )
 
                 fetched += 1
                 logger.debug("Cached %s (%d points)", market_id, len(history))
@@ -244,7 +247,8 @@ class MarketCache:
                 if on_progress:
                     on_progress(fetched, skipped, errors)
 
-            self._conn.commit()
+            with self._lock:
+                self._conn.commit()
 
         stats = {"fetched": fetched, "skipped": skipped, "errors": errors}
         logger.info("Sync complete: %s", stats)
@@ -252,46 +256,49 @@ class MarketCache:
 
     def get_markets(self) -> list[dict]:
         """Return all cached markets."""
-        rows = self._conn.execute(
-            "SELECT id, question, outcome, volume, category FROM markets ORDER BY volume DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, question, outcome, volume, category FROM markets ORDER BY volume DESC"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_market_metadata(self, market_id: str) -> dict | None:
         """Return full metadata JSON for a market."""
-        row = self._conn.execute(
-            "SELECT metadata FROM markets WHERE id = ?", (market_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata FROM markets WHERE id = ?", (market_id,)
+            ).fetchone()
         if row:
             return json.loads(row["metadata"])
         return None
 
     def get_market_ids_by_category(self, category: str) -> list[str]:
         """Return market IDs matching the given category."""
-        rows = self._conn.execute(
-            "SELECT id FROM markets WHERE category = ? ORDER BY volume DESC",
-            (category,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM markets WHERE category = ? ORDER BY volume DESC",
+                (category,),
+            ).fetchall()
         return [row["id"] for row in rows]
 
     def get_price_history(self, market_id: str) -> list[dict]:
         """Return price history for a market as list of {t, p} dicts."""
-        rows = self._conn.execute(
-            "SELECT timestamp, price FROM price_history WHERE market_id = ? ORDER BY timestamp",
-            (market_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT timestamp, price FROM price_history WHERE market_id = ? ORDER BY timestamp",
+                (market_id,),
+            ).fetchall()
         return [{"t": r["timestamp"], "p": r["price"]} for r in rows]
 
     def stats(self) -> dict:
         """Return cache statistics: total markets, total price points, categories."""
-        total = self._conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
-        points = self._conn.execute("SELECT COUNT(*) AS cnt FROM price_history").fetchone()["cnt"]
-
-        # Category breakdown
-        cat_rows = self._conn.execute(
-            "SELECT COALESCE(category, 'uncategorized') AS cat, COUNT(*) AS cnt "
-            "FROM markets GROUP BY cat ORDER BY cnt DESC"
-        ).fetchall()
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
+            points = self._conn.execute("SELECT COUNT(*) AS cnt FROM price_history").fetchone()["cnt"]
+            cat_rows = self._conn.execute(
+                "SELECT COALESCE(category, 'uncategorized') AS cat, COUNT(*) AS cnt "
+                "FROM markets GROUP BY cat ORDER BY cnt DESC"
+            ).fetchall()
         categories = {row["cat"]: row["cnt"] for row in cat_rows}
 
         return {
@@ -300,11 +307,69 @@ class MarketCache:
             "categories": categories,
         }
 
+    def get_outcome(self, market_id: str) -> float | None:
+        """Return the resolution outcome for a market, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT outcome FROM markets WHERE id = ?", (market_id,)
+            ).fetchone()
+        if row and row["outcome"] is not None:
+            return float(row["outcome"])
+        return None
+
+    def get_market_ids_by_date_range(
+        self,
+        before: int | None = None,
+        after: int | None = None,
+    ) -> list[str]:
+        """Return market IDs whose price history falls within a date range.
+
+        Parameters
+        ----------
+        before : int, optional
+            Max timestamp (exclusive). Markets with all prices before this.
+        after : int, optional
+            Min timestamp (inclusive). Markets with any price at or after this.
+
+        Only returns markets with known outcomes (resolution != None).
+        """
+        query = (
+            "SELECT DISTINCT m.id FROM markets m "
+            "JOIN price_history p ON m.id = p.market_id "
+            "WHERE m.outcome IS NOT NULL"
+        )
+        params: list = []
+
+        if before is not None:
+            query += " AND p.timestamp < ?"
+            params.append(before)
+        if after is not None:
+            query += " AND p.timestamp >= ?"
+            params.append(after)
+
+        query += " ORDER BY m.id"
+
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [row[0] for row in rows]
+
+    def get_earliest_latest_timestamps(self) -> tuple[int, int]:
+        """Return (earliest, latest) price timestamps across all markets."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM price_history"
+            ).fetchone()
+        if row and row[0] is not None:
+            return (row[0], row[1])
+        return (0, 0)
+
     def _market_exists(self, market_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM markets WHERE id = ? LIMIT 1", (market_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM markets WHERE id = ? LIMIT 1", (market_id,)
+            ).fetchone()
         return row is not None
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

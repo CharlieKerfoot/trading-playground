@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
-import anthropic
-
+from polymarket_playground.agents.claude_helper import MODEL_TRADING, get_client
 from polymarket_playground.core.action import Action
 from polymarket_playground.core.state import MarketState
 from polymarket_playground.core.types import EpisodeResult
@@ -45,7 +43,7 @@ Actions:
 def _build_context(state: MarketState) -> str:
     """Build a human-readable context string from a MarketState."""
     signals = state.signals
-    return (
+    ctx = (
         f"Polymarket — {state.question}\n"
         f"YES {state.yes_price:.3f} / NO {state.no_price:.3f} | "
         f"Spread {state.spread:.4f}\n"
@@ -58,6 +56,21 @@ def _build_context(state: MarketState) -> str:
         f"Time elapsed: {state.time_elapsed:.1%} | "
         f"Time remaining: {state.time_remaining:.0f}s\n"
     )
+
+    # Surface enriched signals from signal providers (sentiment, edge, etc.)
+    enriched_keys = [
+        "sentiment_score", "information_edge", "news_recency",
+        "signal_confidence", "market_category_score", "resolution_clarity",
+        "volatility_expectation", "information_density",
+    ]
+    enriched = {k: signals[k] for k in enriched_keys if k in signals}
+    if enriched:
+        ctx += "\n--- Analysis Signals ---\n"
+        for key, val in enriched.items():
+            label = key.replace("_", " ").title()
+            ctx += f"{label}: {val:.3f}\n"
+
+    return ctx
 
 
 class ClaudeAgent(BaseAgent):
@@ -75,19 +88,19 @@ class ClaudeAgent(BaseAgent):
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6",
+        model: str = MODEL_TRADING,
         api_key: str | None = None,
+        strategy_memory_path: str | None = None,
     ) -> None:
         self.model = model
-        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if resolved_key:
-            self.client = anthropic.Anthropic(api_key=resolved_key)
-        else:
+        self.client = get_client(api_key)
+        if self.client is None:
             logger.warning("No ANTHROPIC_API_KEY found. ClaudeAgent will return hold actions.")
-            self.client = None
         self.history: list[dict[str, str]] = []
         self._step: int = 0
         self._cumulative_reward: float = 0.0
+        self._strategy_memory_path = strategy_memory_path
+        self._strategy_context: str = ""
 
     def act(self, state: MarketState) -> Action:
         self._step += 1
@@ -121,10 +134,20 @@ class ClaudeAgent(BaseAgent):
             self.history.append({"role": "assistant", "content": raw})
             return Action(direction=0, size=0.0, reasoning="no API key")
 
+        # Build system prompt with strategy memory if available
+        system = SYSTEM_PROMPT
+        if self._strategy_context:
+            system += (
+                "\n\n--- Strategy Insights (learned from prior training) ---\n"
+                + self._strategy_context
+            )
+
         try:
+            import anthropic
+
             response = self.client.messages.create(
                 model=self.model,
-                system=SYSTEM_PROMPT,
+                system=system,
                 messages=self.history,
                 max_tokens=512,
             )
@@ -138,7 +161,12 @@ class ClaudeAgent(BaseAgent):
                 cleaned = cleaned.strip()
             parsed = json.loads(cleaned)
             action = Action.from_dict(parsed)
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, anthropic.AuthenticationError, anthropic.APIError) as exc:
+        except (anthropic.AuthenticationError, anthropic.APIError) as exc:
+            logger.error("Anthropic API error, disabling client: %s", exc)
+            self.client = None
+            raw = '{"action": "hold", "size": 0.0, "reasoning": "api error"}'
+            action = Action(direction=0, size=0.0, reasoning="api error")
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             logger.warning("Failed to parse Claude response, defaulting to hold: %s", exc)
             raw = '{"action": "hold", "size": 0.0, "reasoning": "parse error fallback"}'
             action = Action(direction=0, size=0.0, reasoning="parse error fallback")
@@ -151,5 +179,20 @@ class ClaudeAgent(BaseAgent):
         self._step = 0
         self._cumulative_reward = 0.0
 
+        # Load strategy memory if configured
+        if self._strategy_memory_path and not self._strategy_context:
+            from polymarket_playground.agents.strategy_memory import StrategyMemory
+
+            memory = StrategyMemory(self._strategy_memory_path)
+            self._strategy_context = memory.load()
+
     def on_episode_end(self, result: EpisodeResult) -> None:
         self._cumulative_reward = result.total_reward
+
+    def reload_strategy_memory(self) -> None:
+        """Explicitly reload strategy memory (call between training batches)."""
+        if self._strategy_memory_path:
+            from polymarket_playground.agents.strategy_memory import StrategyMemory
+
+            memory = StrategyMemory(self._strategy_memory_path)
+            self._strategy_context = memory.load()

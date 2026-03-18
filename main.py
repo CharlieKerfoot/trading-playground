@@ -11,27 +11,31 @@ console = Console()
 
 
 def _get_agent(agent_name: str, config: dict | None = None):
-    """Get agent by name."""
-    from polymarket_playground.agents.rule_agent import RuleAgent
-    from polymarket_playground.agents.claude_agent import ClaudeAgent
-    from polymarket_playground.agents.rl_agent import RLAgent
+    """Get agent by name.
 
-    config = config or {}
+    Passes through config to the agent factory. For Claude agents,
+    config can include 'strategy_memory_path' to enable learning loop.
+    """
+    from polymarket_playground.agents import create_agent
 
-    agents = {
-        "rule": lambda: RuleAgent(),
-        "claude": lambda: ClaudeAgent(**{k: v for k, v in config.items() if k in ("model", "api_key")}),
-        "rl": lambda: RLAgent(policy=None),
-        "random": lambda: RLAgent(policy=None),
-    }
+    try:
+        return create_agent(agent_name, config)
+    except ValueError as e:
+        raise click.BadParameter(str(e))
 
-    if ":" in agent_name and agent_name.startswith("rl:"):
-        model_path = agent_name.split(":", 1)[1]
-        return RLAgent.load(model_path)
 
-    if agent_name not in agents:
-        raise click.BadParameter(f"Unknown agent: {agent_name}. Choose from: {list(agents.keys())}")
-    return agents[agent_name]()
+def _get_signal_provider(mode: str = "historical"):
+    """Create the appropriate signal provider.
+
+    mode: "historical" for training on resolved markets (Claude-only),
+          "live" for live/paper trading (web search + Claude).
+    """
+    if mode == "live":
+        from polymarket_playground.data.signal_provider import LiveSignalProvider
+        return LiveSignalProvider()
+    else:
+        from polymarket_playground.data.signal_provider import HistoricalSignalProvider
+        return HistoricalSignalProvider()
 
 
 def _find_free_port(start: int = 8000) -> int:
@@ -173,7 +177,8 @@ def sync(limit: int, category: str | None):
 @click.option("--agent", default="rule", help="Agent type: rule, claude, random, rl")
 @click.option("--episodes", default=50, help="Number of episodes")
 @click.option("--category", default=None, help="Filter by category")
-def train(agent: str, episodes: int, category: str | None):
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def train(agent: str, episodes: int, category: str | None, signals: bool):
     """Run episode-based training from the CLI."""
     from polymarket_playground.core.env import TradingEnv
     from polymarket_playground.data.market_cache import MarketCache
@@ -191,7 +196,8 @@ def train(agent: str, episodes: int, category: str | None):
         console.print("[red]No markets in cache.[/red] Run sync first.")
         return
 
-    env = TradingEnv(cache=cache, config={"max_steps": 100})
+    signal_provider = _get_signal_provider("historical") if signals else None
+    env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
     if category:
         env.data.set_market_filter(category)
 
@@ -240,7 +246,8 @@ def train(agent: str, episodes: int, category: str | None):
 @click.option("--category", default=None, help="Filter by category")
 @click.option("--save-path", default=None, help="Path to save trained model")
 @click.option("--eval-episodes", default=50, help="Episodes to run for evaluation after training")
-def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: str | None, eval_episodes: int):
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: str | None, eval_episodes: int, signals: bool):
     """Train an RL agent using Stable-Baselines3, then evaluate."""
     from pathlib import Path
     from polymarket_playground.core.env import TradingEnv
@@ -261,7 +268,8 @@ def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: st
         console.print("[red]No markets in cache.[/red] Run sync first.")
         return
 
-    env = TradingEnv(cache=cache, config={"max_steps": 100})
+    signal_provider = _get_signal_provider("historical") if signals else None
+    env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
     if category:
         env.data.set_market_filter(category)
 
@@ -284,7 +292,7 @@ def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: st
     from polymarket_playground.eval.train import GymWrapper
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-    eval_env = TradingEnv(cache=cache, config={"max_steps": 100})
+    eval_env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
     if category:
         eval_env.data.set_market_filter(category)
     eval_wrapped = GymWrapper(eval_env)
@@ -315,7 +323,8 @@ def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: st
 @click.option("--agents", multiple=True, required=True, help="Agent types to compare")
 @click.option("--episodes", default=50, help="Number of episodes")
 @click.option("--category", default=None, help="Filter by category")
-def compare(agents: tuple[str], episodes: int, category: str | None):
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def compare(agents: tuple[str], episodes: int, category: str | None, signals: bool):
     """Compare multiple agents head-to-head on identical episodes."""
     from polymarket_playground.core.env import TradingEnv
     from polymarket_playground.data.market_cache import MarketCache
@@ -328,7 +337,8 @@ def compare(agents: tuple[str], episodes: int, category: str | None):
         console.print("[red]No markets in cache.[/red] Run sync first.")
         return
 
-    env = TradingEnv(cache=cache, config={"max_steps": 100})
+    signal_provider = _get_signal_provider("historical") if signals else None
+    env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
     if category:
         env.data.set_market_filter(category)
 
@@ -390,6 +400,7 @@ def stats():
 @click.option("--max-position", default=50.0, help="Max position size per market (USD)")
 @click.option("--max-exposure", default=200.0, help="Max total exposure (USD)")
 @click.option("--max-loss", default=100.0, help="Session kill switch loss (USD)")
+@click.option("--signals/--no-signals", default=False, help="Enable live signal analysis (web search + Claude)")
 def live(
     agent: str,
     markets: str,
@@ -400,6 +411,7 @@ def live(
     max_position: float,
     max_exposure: float,
     max_loss: float,
+    signals: bool,
 ):
     """Run an agent against live Polymarket data."""
     import logging
@@ -460,12 +472,14 @@ def live(
         max_ticks=max_ticks,
     )
 
+    signal_provider = _get_signal_provider("live") if signals else None
     runner = LiveRunner(
         agent=agent_obj,
         executor=executor,
         adapter=adapter,
         config=config,
         session_log=SessionLog(),
+        signal_provider=signal_provider,
     )
 
     console.print("\n[bold green]Starting...[/bold green] (Ctrl+C to stop)\n")
@@ -560,6 +574,422 @@ def session_report(session_id: int):
         if len(actions_taken) > 10:
             console.print(f"    ... and {len(actions_taken) - 10} more actions")
         console.print()
+
+
+@cli.command()
+@click.option("--agents", multiple=True, default=("rule", "claude"), help="Agent types to train")
+@click.option("--episodes", default=100, help="Episodes per agent")
+@click.option("--train-split", default=0.7, help="Fraction of markets for training")
+@click.option("--sync-limit", default=200, help="Max markets to sync")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--significance", default=0.05, help="p-value threshold for significance")
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def pipeline(
+    agents: tuple[str],
+    episodes: int,
+    train_split: float,
+    sync_limit: int,
+    category: str | None,
+    significance: float,
+    signals: bool,
+):
+    """End-to-end pipeline: sync → train → validate → rank → recommend."""
+    from polymarket_playground.core.env import TradingEnv
+    from polymarket_playground.data.market_cache import MarketCache
+    from polymarket_playground.eval.metrics import (
+        avg_pnl,
+        sharpe_ratio,
+        validate_strategy,
+        compare_vs_random,
+        win_rate,
+    )
+    from polymarket_playground.eval.runner import EpisodeRunner
+
+    cache = MarketCache()
+    signal_provider = _get_signal_provider("historical") if signals else None
+
+    # --- Stage 1: Sync ---
+    console.print("[bold]Stage 1: Sync[/bold]")
+    stats = cache.stats()
+    if stats["total_markets"] < 20:
+        console.print(f"  Syncing up to {sync_limit} markets...")
+        result = cache.sync(limit=sync_limit, category=category)
+        console.print(f"  Synced: {result}")
+    else:
+        console.print(f"  Cache ready: {stats['total_markets']} markets")
+
+    # --- Stage 2: Split ---
+    console.print("\n[bold]Stage 2: Train/Test Split[/bold]")
+    earliest, latest = cache.get_earliest_latest_timestamps()
+    if earliest == 0:
+        console.print("[red]No price data available.[/red]")
+        return
+
+    cutoff = earliest + int((latest - earliest) * train_split)
+    train_ids = cache.get_market_ids_by_date_range(before=cutoff)
+    test_ids = cache.get_market_ids_by_date_range(after=cutoff)
+
+    # Remove overlap — markets that span the cutoff go to train
+    test_ids = [mid for mid in test_ids if mid not in set(train_ids)]
+
+    if len(train_ids) < 5:
+        console.print(f"[red]Too few training markets ({len(train_ids)}). Need ≥5.[/red]")
+        return
+    if len(test_ids) < 3:
+        console.print(f"[yellow]Warning: only {len(test_ids)} test markets.[/yellow]")
+
+    console.print(f"  Train: {len(train_ids)} markets | Test: {len(test_ids)} markets")
+
+    # --- Stage 3: Train ---
+    console.print("\n[bold]Stage 3: Train[/bold]")
+    agent_results: dict[str, dict] = {}
+
+    for agent_name in agents:
+        console.print(f"\n  Training [cyan]{agent_name}[/cyan]...")
+        try:
+            env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
+            env.data.set_market_ids(train_ids)
+
+            agent_obj = _get_agent(agent_name)
+            runner = EpisodeRunner(env, agent_obj)
+
+            # Train
+            train_results = runner.run(episodes)
+            console.print(
+                f"    Train: Sharpe={sharpe_ratio(train_results):.4f} "
+                f"WinRate={win_rate(train_results):.1%} "
+                f"AvgPnL={avg_pnl(train_results):+.6f}"
+            )
+
+            # Test (out-of-sample)
+            if test_ids:
+                test_env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
+                test_env.data.set_market_ids(test_ids)
+                test_runner = EpisodeRunner(test_env, agent_obj)
+                test_results = test_runner.run(min(episodes, len(test_ids) * 3))
+            else:
+                test_results = []
+
+            agent_results[agent_name] = {
+                "train": train_results,
+                "test": test_results,
+            }
+
+            if test_results:
+                console.print(
+                    f"    Test:  Sharpe={sharpe_ratio(test_results):.4f} "
+                    f"WinRate={win_rate(test_results):.1%} "
+                    f"AvgPnL={avg_pnl(test_results):+.6f}"
+                )
+
+        except Exception as exc:
+            console.print(f"    [red]Failed: {exc}[/red]")
+            agent_results[agent_name] = {"train": [], "test": [], "error": str(exc)}
+
+    # --- Stage 4: Validate ---
+    console.print("\n[bold]Stage 4: Statistical Validation[/bold]")
+
+    # Run random baseline for comparison
+    random_env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
+    if test_ids:
+        random_env.data.set_market_ids(test_ids)
+    random_agent = _get_agent("random")
+    random_runner = EpisodeRunner(random_env, random_agent)
+    random_results = random_runner.run(episodes)
+
+    validated: list[tuple[str, dict]] = []
+    for agent_name, results in agent_results.items():
+        if "error" in results:
+            continue
+
+        test_results = results.get("test", results["train"])
+        if not test_results:
+            continue
+
+        validation = validate_strategy(test_results, significance_level=significance)
+        beats_random, vs_random_p = compare_vs_random(test_results, random_results, significance)
+
+        console.print(f"\n  [cyan]{agent_name}[/cyan]:")
+        console.print(f"    {validation}")
+        console.print(f"    Beats random: {'YES' if beats_random else 'NO'} (p={vs_random_p:.4f})")
+
+        validated.append((agent_name, {
+            "validation": validation,
+            "beats_random": beats_random,
+            "vs_random_p": vs_random_p,
+            "test_results": test_results,
+        }))
+
+    # --- Stage 5: Rank & Recommend ---
+    console.print("\n[bold]Stage 5: Recommendation[/bold]")
+
+    # Sort by Sharpe ratio on test set
+    ranked = sorted(
+        validated,
+        key=lambda x: x[1]["validation"].sharpe,
+        reverse=True,
+    )
+
+    table = Table(title="Strategy Ranking")
+    table.add_column("Rank", style="dim")
+    table.add_column("Agent", style="cyan")
+    table.add_column("Sharpe", style="green")
+    table.add_column("Win Rate", style="green")
+    table.add_column("Significant?", style="bold")
+    table.add_column("Beats Random?", style="bold")
+    table.add_column("Recommendation")
+
+    for i, (name, data) in enumerate(ranked):
+        v = data["validation"]
+        rec = "[green]DEPLOY[/green]" if v.is_significant and data["beats_random"] else "[red]SKIP[/red]"
+        table.add_row(
+            str(i + 1),
+            name,
+            f"{v.sharpe:.4f}",
+            f"{win_rate(data['test_results']):.1%}",
+            "YES" if v.is_significant else "NO",
+            "YES" if data["beats_random"] else "NO",
+            rec,
+        )
+
+    console.print(table)
+
+    deployable = [n for n, d in ranked if d["validation"].is_significant and d["beats_random"]]
+    if deployable:
+        console.print(f"\n[bold green]Deployable strategies: {', '.join(deployable)}[/bold green]")
+        console.print("Run with: python main.py live --agent <name> --markets <ids> --mode paper")
+    else:
+        console.print("\n[yellow]No strategies passed validation. More training or better signals needed.[/yellow]")
+
+
+@cli.command()
+@click.option("--agent", default="claude", help="Agent type")
+@click.option("--episodes", default=50, help="Episodes per batch")
+@click.option("--batches", default=5, help="Number of training batches")
+@click.option("--memory-path", default="strategy_memory.md", help="Path to strategy memory file")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def train_with_memory(
+    agent: str,
+    episodes: int,
+    batches: int,
+    memory_path: str,
+    category: str | None,
+    signals: bool,
+):
+    """Train Claude agent with learning loop (strategy memory across batches)."""
+    from polymarket_playground.agents.strategy_memory import StrategyMemory
+    from polymarket_playground.core.env import TradingEnv
+    from polymarket_playground.data.market_cache import MarketCache
+    from polymarket_playground.eval.metrics import avg_pnl, sharpe_ratio, win_rate
+    from polymarket_playground.eval.runner import EpisodeRunner
+
+    cache = MarketCache()
+    stats = cache.stats()
+    if stats["total_markets"] == 0:
+        console.print("[red]No markets in cache.[/red] Run sync first.")
+        return
+
+    signal_provider = _get_signal_provider("historical") if signals else None
+    memory = StrategyMemory(memory_path)
+
+    console.print(f"[bold]Training {agent} with learning loop[/bold]")
+    console.print(f"Batches: {batches} × {episodes} episodes = {batches * episodes} total")
+    console.print(f"Strategy memory: {memory_path}")
+    if signals:
+        console.print("[dim]  (signal analysis enabled)[/dim]")
+    if memory.load():
+        console.print("[dim]  (existing memory found, will build on it)[/dim]")
+    else:
+        console.print("[dim]  (starting fresh)[/dim]")
+
+    all_results = []
+    for batch in range(batches):
+        console.print(f"\n[bold]Batch {batch + 1}/{batches}[/bold]")
+
+        env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
+        if category:
+            env.data.set_market_filter(category)
+
+        agent_obj = _get_agent(agent, {"strategy_memory_path": memory_path})
+        runner = EpisodeRunner(env, agent_obj)
+        results = runner.run(episodes)
+        all_results.extend(results)
+
+        console.print(
+            f"  Sharpe={sharpe_ratio(results):.4f} "
+            f"WinRate={win_rate(results):.1%} "
+            f"AvgPnL={avg_pnl(results):+.6f}"
+        )
+
+        # Update strategy memory after batch
+        console.print("  Updating strategy memory...")
+        memory.update(results)
+
+    console.print(f"\n[bold green]Overall ({len(all_results)} episodes):[/bold green]")
+    console.print(f"  Sharpe: {sharpe_ratio(all_results):.4f}")
+    console.print(f"  Win Rate: {win_rate(all_results):.1%}")
+    console.print(f"  Avg P&L: {avg_pnl(all_results):+.6f}")
+
+
+@cli.command()
+@click.option("--agent", default="rule", help="Agent type: rule, claude, random")
+@click.option("--market-id", default=None, help="Specific market ID (random if omitted)")
+@click.option("--max-steps", default=50, help="Max steps per episode")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis (costs API calls)")
+def replay(agent: str, market_id: str | None, max_steps: int, category: str | None, signals: bool):
+    """Replay an episode with step-by-step price, trades, P&L, and reasoning."""
+    from polymarket_playground.core.action import DIRECTION_NAMES
+    from polymarket_playground.core.env import TradingEnv
+    from polymarket_playground.core.types import EpisodeResult
+    from polymarket_playground.data.market_cache import MarketCache
+
+    cache = MarketCache()
+    stats = cache.stats()
+    if stats["total_markets"] == 0:
+        console.print("[red]No markets in cache.[/red] Run sync first.")
+        return
+
+    signal_provider = _get_signal_provider("historical") if signals else None
+    env = TradingEnv(cache=cache, config={"max_steps": max_steps}, signal_provider=signal_provider)
+    if category:
+        env.data.set_market_filter(category)
+    if market_id:
+        env.data.set_market_ids([market_id])
+
+    agent_obj = _get_agent(agent)
+
+    # Run one episode, collecting detailed data
+    env.reset()
+    agent_obj.on_reset(env.state)
+
+    episode_market_id = env.state.market_id
+    question = env.state.question
+    result = EpisodeResult()
+    prices: list[float] = [env.state.yes_price]
+    pnl_curve: list[float] = [0.0]
+
+    done = False
+    while not done:
+        action = agent_obj.act(env.state)
+        _obs, reward, terminated, truncated, info = env.step(action)
+        result.record(action, reward, info)
+        prices.append(info["state"]["yes_price"])
+        pnl_curve.append(pnl_curve[-1] + reward)
+        done = terminated or truncated
+
+    agent_obj.on_episode_end(result)
+
+    # --- Display ---
+    console.print(f"\n[bold]Episode Replay[/bold]")
+    console.print(f"Market: [cyan]{episode_market_id}[/cyan]")
+    console.print(f"Question: {question}")
+    console.print(f"Agent: {agent} | Steps: {result.n_steps} | Total P&L: {result.total_reward:+.4f}")
+
+    # ASCII price chart
+    console.print(f"\n[bold]Price Chart (YES)[/bold]")
+    _print_ascii_chart(prices, label="Price", color="blue")
+
+    # P&L curve
+    console.print(f"\n[bold]Cumulative P&L[/bold]")
+    _print_ascii_chart(pnl_curve, label="P&L", color="green")
+
+    # Trade log
+    console.print(f"\n[bold]Trade Log[/bold]")
+    trade_table = Table()
+    trade_table.add_column("Step", style="dim")
+    trade_table.add_column("Action", style="cyan")
+    trade_table.add_column("Size")
+    trade_table.add_column("Price")
+    trade_table.add_column("Reward", style="green")
+    trade_table.add_column("Cum P&L")
+    trade_table.add_column("Position")
+    trade_table.add_column("Reasoning")
+
+    for i, (action, reward, info) in enumerate(
+        zip(result.actions, result.rewards, result.infos)
+    ):
+        action_name = DIRECTION_NAMES.get(action.direction, "hold")
+        fill = info.get("fill", {})
+        pos = info.get("position", {})
+        reasoning = action.reasoning[:60] if action.reasoning else ""
+
+        # Only show non-hold actions in detail, but always show trades
+        if action.direction != 0 or abs(reward) > 0.001:
+            pos_str = ""
+            if pos.get("yes_shares", 0) > 0:
+                pos_str += f"Y:{pos['yes_shares']:.1f}"
+            if pos.get("no_shares", 0) > 0:
+                pos_str += f" N:{pos['no_shares']:.1f}"
+            if not pos_str:
+                pos_str = "flat"
+
+            trade_table.add_row(
+                str(i + 1),
+                action_name,
+                f"{fill.get('size', 0):.2f}",
+                f"{fill.get('price', 0):.4f}",
+                f"{reward:+.4f}",
+                f"{pnl_curve[i + 1]:+.4f}",
+                pos_str,
+                reasoning,
+            )
+
+    console.print(trade_table)
+
+    # Final summary
+    final_info = result.infos[-1] if result.infos else {}
+    final_state = final_info.get("state", {})
+    final_pos = final_info.get("position", {})
+    console.print(f"\n[bold]Final State[/bold]")
+    console.print(f"  Resolved: {final_state.get('is_resolved', False)}")
+    console.print(f"  Final price: {final_state.get('yes_price', 0):.4f}")
+    console.print(f"  Realized P&L: {final_pos.get('realized_pnl', 0):+.4f}")
+    console.print(f"  Total reward: {result.total_reward:+.4f}")
+
+
+def _print_ascii_chart(
+    values: list[float], label: str = "", color: str = "white", width: int = 60, height: int = 12,
+) -> None:
+    """Print a simple ASCII chart using Rich."""
+    if not values:
+        return
+
+    min_val = min(values)
+    max_val = max(values)
+    val_range = max_val - min_val or 0.001
+
+    # Resample to fit width
+    if len(values) > width:
+        step = len(values) / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = values
+
+    # Build rows
+    rows: list[str] = []
+    for row in range(height):
+        threshold = max_val - (row / (height - 1)) * val_range
+        line = ""
+        for val in sampled:
+            if val >= threshold:
+                line += "█"
+            else:
+                line += " "
+        # Y-axis label on first, middle, last rows
+        if row == 0:
+            rows.append(f"  {max_val:>8.4f} │{line}│")
+        elif row == height - 1:
+            rows.append(f"  {min_val:>8.4f} │{line}│")
+        elif row == height // 2:
+            mid = (max_val + min_val) / 2
+            rows.append(f"  {mid:>8.4f} │{line}│")
+        else:
+            rows.append(f"           │{line}│")
+
+    for r in rows:
+        console.print(f"[{color}]{r}[/{color}]")
 
 
 if __name__ == "__main__":

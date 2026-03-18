@@ -30,6 +30,7 @@ class TradingEnv(gym.Env):
         self,
         cache: MarketCache,
         config: dict | None = None,
+        signal_provider: object | None = None,
     ):
         super().__init__()
         self.cache = cache
@@ -38,7 +39,7 @@ class TradingEnv(gym.Env):
         self.executor = PaperExecutor(config=self.config)
         max_steps = self.config.get("max_steps", 50)
         self.position_limit: float = self.config.get("position_limit", 10.0)
-        self.data = HistoricalLoader(cache, max_steps=max_steps)
+        self.data = HistoricalLoader(cache, max_steps=max_steps, signal_provider=signal_provider)
         self.position: Position | None = None
         self.state: MarketState | None = None
         self._total_fees: float = 0.0

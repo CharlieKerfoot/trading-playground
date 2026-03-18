@@ -4,12 +4,11 @@
 
 Three hard requirements drive every decision:
 
-1. **Agent-agnostic** — Claude agents, RL policies, rule-based bots all plug in identically. No agent knows or cares how the env works underneath.
+1. **Agent-agnostic** — Claude agents, RL policies, rule-based bots all plug in identically via `BaseAgent`. No agent knows or cares how the env works underneath.
 
-2. **Market-agnostic** — BTC contracts, election markets, sports, macro events. Market-specific
-   logic lives in swappable `MarketAdapter` plugins, not the core env.
+2. **Market-agnostic** — All markets are represented as binary outcome contracts with YES/NO prices. Market-specific details live in cached metadata, not the core env.
 
-3. **Training-focused** — The environment uses historical replay data and paper execution only. All agents train and evaluate against resolved market data.
+3. **Training-focused** — The environment uses historical replay from cached Polymarket data and paper execution only. All agents train and evaluate against resolved market data.
 
 ---
 
@@ -19,48 +18,53 @@ Three hard requirements drive every decision:
 polymarket_playground/
 │
 ├── core/
-│   ├── env.py                  # Base TradingEnv (Gymnasium-compatible)
+│   ├── env.py                  # TradingEnv (Gymnasium-compatible)
 │   ├── state.py                # MarketState — universal market snapshot
 │   ├── position.py             # Position tracking, P&L, settlement
-│   ├── action.py               # Action schema (direction, size, order type)
-│   └── types.py                # Shared types: Fill, Episode, Resolution
-│
-├── markets/                    # Market-specific adapters (plug-in system)
-│   ├── base_adapter.py         # Abstract MarketAdapter interface
-│   ├── btc_price.py            # BTC prediction contracts + Binance signals
-│   ├── elections.py            # Political markets
-│   ├── sports.py               # Sports outcome markets
-│   └── macro.py                # Fed rate, CPI, earnings markets
+│   ├── action.py               # Action schema (direction, size)
+│   ├── types.py                # Shared types: Fill, Episode, EpisodeResult
+│   └── portfolio.py            # Multi-market portfolio (for live trading)
 │
 ├── data/
-│   ├── polymarket_client.py    # Polymarket CLOB REST + WebSocket
-│   ├── external_feeds.py       # Generic external signal fetcher (Binance, news, etc.)
-│   ├── historical_loader.py    # Replay from Polymarket history + Kaggle dump
-│   └── episode_store.py        # Persistent episode cache (SQLite or Parquet)
+│   ├── market_cache.py         # SQLite-backed cache for resolved markets
+│   ├── historical_loader.py    # Episode replay from cached price history
+│   ├── polymarket_client.py    # Polymarket CLOB REST API client
+│   ├── episode_store.py        # Persistent run/episode storage (SQLite)
+│   ├── signal_provider.py      # Signal providers (Historical + Live)
+│   └── session_log.py          # Live trading session log
 │
 ├── execution/
 │   ├── base_executor.py        # Abstract executor interface
 │   ├── paper_executor.py       # Simulated fills with slippage model
-│   └── slippage_model.py       # Fill simulation from order book depth
+│   ├── slippage_model.py       # Quadratic market impact model
+│   ├── live_executor.py        # Real order placement (py-clob-client)
+│   └── risk_gate.py            # Risk controls for live trading
 │
 ├── agents/
+│   ├── __init__.py             # create_agent() factory + re-exports
 │   ├── base_agent.py           # Abstract agent interface
-│   ├── claude_agent.py         # Claude API agent (structured prompt/response)
-│   ├── rl_agent.py             # RL policy wrapper (SB3/CleanRL compatible)
-│   └── rule_agent.py           # Deterministic rule-based baseline
+│   ├── claude_agent.py         # Claude API agent (multi-turn, JSON output)
+│   ├── claude_helper.py        # Shared Claude API wrapper (retry, rate limits)
+│   ├── strategy_memory.py      # Persistent strategy memory for learning loop
+│   ├── rl_agent.py             # RL policy wrapper (SB3-compatible)
+│   └── rule_agent.py           # Deterministic threshold-based baseline
 │
 ├── eval/
-│   ├── runner.py               # Episode runner (single agent or multi-agent)
-│   ├── metrics.py              # Sharpe, win rate, avg P&L, spread capture
-│   ├── compare.py              # Head-to-head agent comparison harness
-│   └── visualize.py            # P&L curves, position timelines
+│   ├── runner.py               # Episode runner + multi-agent comparison
+│   ├── train.py                # SB3 RL training (PPO/A2C) + GymWrapper
+│   ├── metrics.py              # Sharpe, win rate, avg P&L, validation, bootstrap CI
+│   └── compare.py              # Head-to-head comparison analysis
 │
-├── config/
-│   ├── base.yaml               # Default env config
-│   ├── btc.yaml                # BTC market config
-│   └── elections.yaml          # Election market config
+├── training/
+│   ├── run_manager.py          # Async batch run orchestration (FastAPI)
+│   └── live_runner.py          # Real-time trading loop (paper/live/dry-run)
 │
-└── cli.py                      # Entry point: run agents, replay, compare
+├── markets/
+│   └── polymarket.py           # PolymarketAdapter (live state builder)
+│
+└── server.py                   # FastAPI backend + WebSocket streaming
+
+main.py                         # CLI entry point (click)
 ```
 
 ---
@@ -69,156 +73,114 @@ polymarket_playground/
 
 ### `MarketState` — the universal snapshot
 
-Every market adapter produces this same struct at each timestep. Agents see only this.
+Every timestep produces this struct. Agents see only this.
 
 ```python
 @dataclass
 class MarketState:
-    # Contract identity
-    market_id:       str
-    market_type:     str           # "btc_price" | "election" | "sports" | ...
-    question:        str           # Human-readable: "BTC above $95k at 3pm UTC?"
-    resolution_time: datetime
+    market_id: str
+    market_type: str
+    question: str
 
-    # Polymarket prices
-    yes_price:       float         # [0, 1]
-    no_price:        float         # [0, 1]
-    yes_bid:         float
-    yes_ask:         float
-    no_bid:          float
-    no_ask:          float
-    spread:          float
-    book_depth:      float         # liquidity at best bid/ask (USDC)
+    yes_price: float          # [0, 1]
+    no_price: float           # [0, 1]
+    yes_bid, yes_ask: float
+    no_bid, no_ask: float
+    spread: float
+    book_depth: float
 
-    # Time
-    time_elapsed:    float         # fraction of contract life elapsed [0,1]
-    time_remaining:  float         # seconds until resolution
-    timestamp:       datetime
+    time_elapsed: float       # fraction of episode elapsed [0, 1]
+    time_remaining: float     # seconds
+    timestamp: datetime
 
-    # External signals (market-type specific, keyed dict)
-    signals:         dict[str, float]
+    signals: dict[str, float] # best_bid, best_ask, volume_24hr, etc.
 
-    # Resolution (None until market closes)
-    is_resolved:     bool
-    resolution:      Optional[float]   # 1.0 = YES, 0.0 = NO
+    is_resolved: bool
+    resolution: float | None  # 1.0 = YES, 0.0 = NO
+
+    # Agent position (injected by env after each step)
+    agent_yes_shares: float
+    agent_no_shares: float
+    agent_cost_basis: float
+    agent_realized_pnl: float
 ```
 
-### `MarketAdapter` — plug-in market logic
+### Agent Interface
 
-```python
-class MarketAdapter(ABC):
-    @abstractmethod
-    def get_markets(self) -> list[str]: ...
-
-    @abstractmethod
-    def fetch_signals(self, market_id: str, timestamp: datetime) -> dict[str, float]: ...
-
-    @abstractmethod
-    def build_agent_context(self, state: MarketState) -> str: ...
-
-    @abstractmethod
-    def select_episodes(self, filters: dict) -> list[Episode]: ...
-```
-
-**Concrete adapters:** BTCPriceAdapter, ElectionAdapter, SportsAdapter, MacroAdapter.
-
-Adding a new market type = adding one file in `markets/`. Zero core changes.
-
----
-
-## Base Environment: `core/env.py`
-
-```python
-class TradingEnv(gym.Env):
-    """
-    Market-agnostic, agent-agnostic Gymnasium environment.
-
-    Parameterized entirely by:
-      - adapter: which MarketAdapter to use
-      - config:  position limits, step size, episode filters
-    """
-
-    def __init__(self, adapter: MarketAdapter, config: dict = None):
-        self.adapter  = adapter
-        self.executor = PaperExecutor(config=config)
-        self.data     = HistoricalLoader(adapter, max_steps=config.get("max_steps", 50))
-        self.position = None
-        self.state    = None
-```
-
----
-
-## Agent Interface
-
-Every agent implements this — RL policies, Claude, rule-based:
+Every agent implements `BaseAgent`:
 
 ```python
 class BaseAgent(ABC):
     @abstractmethod
     def act(self, state: MarketState) -> Action: ...
-
-    def on_reset(self, state: MarketState):
-        pass
-
-    def on_episode_end(self, result: EpisodeResult):
-        pass
+    def on_reset(self, state: MarketState): ...
+    def on_episode_end(self, result: EpisodeResult): ...
 ```
+
+Agents are created via `create_agent(agent_type, config)` from `polymarket_playground.agents`.
 
 ---
 
-## CLI: `cli.py`
-
-```bash
-# Run Claude agent on BTC markets
-uv run python cli.py run \
-  --agent claude \
-  --market btc \
-  --episodes 200
-
-# Run RL training on election markets
-uv run python cli.py train \
-  --market elections \
-  --timesteps 1000000
-
-# Compare Claude vs random on sports markets
-uv run python cli.py compare \
-  --agents claude --agents random \
-  --market sports \
-  --episodes 100 \
-  --seed 42
-```
-
----
-
-## Data Flow Summary
+## Data Flow
 
 ```
                     ┌─────────────────────────────────┐
-                    │         MarketAdapter            │
-                    │  (btc / elections / sports / ...) │
+                    │          MarketCache             │
+                    │   (SQLite: markets + prices)     │
                     └────────────┬────────────────────┘
-                                 │ fetch_signals()
+                                 │ get_price_history()
                     ┌────────────▼────────────────────┐
                     │      HistoricalLoader            │
+                    │  (random window, resample,       │
+                    │   resolve on last step)          │
                     └────────────┬────────────────────┘
                                  │ MarketState
                     ┌────────────▼────────────────────┐
                     │         TradingEnv               │
-                    │  (Gymnasium core, market-agnostic)│
+                    │  (Gymnasium, paper execution,    │
+                    │   position tracking, rewards)    │
                     └────┬──────────────┬─────────────┘
                          │              │
               MarketState│              │Action
                          │              │
           ┌──────────────▼──┐    ┌──────▼──────────────┐
-          │   ClaudeAgent   │    │     RL / Rule Agent  │
+          │   ClaudeAgent   │    │   RL / Rule / Random │
           │  (language in,  │    │  (obs vector in,     │
-          │   JSON out)     │    │   int/float out)     │
+          │   JSON out)     │    │   discrete out)      │
           └─────────────────┘    └─────────────────────┘
-                         │              │
-                    ┌────▼──────────────▼─────────────┐
-                    │         EpisodeRunner            │
-                    │    (drives loop, logs results)   │
-                    └─────────────────────────────────┘
+```
+
+---
+
+## CLI
+
+```bash
+# Sync resolved markets from Polymarket
+uv run python main.py sync --limit 200
+
+# Train a rule-based agent (--signals enables Claude signal analysis)
+uv run python main.py train --agent rule --episodes 100 --signals
+
+# Train RL (PPO) and evaluate
+uv run python main.py train-rl --timesteps 500000 --algorithm PPO
+
+# Train Claude with learning loop (strategy memory across batches)
+uv run python main.py train-with-memory --batches 5 --episodes 50 --signals
+
+# Compare agents head-to-head
+uv run python main.py compare --agents rule --agents claude --episodes 50
+
+# End-to-end pipeline: sync → split → train → validate → rank → recommend
+uv run python main.py pipeline --signals
+
+# Replay a single episode with price chart, trades, P&L, reasoning
+uv run python main.py replay --agent claude --signals
+
+# Run agent against live Polymarket (--signals enables web search + Claude)
+uv run python main.py live --agent claude --markets <id> --mode paper --signals
+
+# Start web UI + API
+uv run python main.py serve
 ```
 
 ---
@@ -226,18 +188,13 @@ uv run python cli.py compare \
 ## Key Design Decisions
 
 **Why `MarketState` instead of a numpy obs vector at the agent boundary?**
-Claude agents need language, not floats. RL agents need floats, not language. By passing the
-full state object and letting each agent extract what it needs, neither is compromised.
+Claude agents need language, not floats. RL agents need floats, not language. By passing the full state object and letting each agent extract what it needs, neither is compromised.
 
 **Why conversation history within episodes for Claude?**
-A memoryless Claude that sees only the current tick can't reason about its own position or
-track how the market has evolved. Multi-turn history within an episode makes Claude a proper
-stateful agent.
-
-**Why adapter-level signal fetching instead of a global feature store?**
-Different market types need radically different external signals. Adapter-scoped fetching
-keeps each market type self-contained and independently testable.
+A memoryless Claude that sees only the current tick can't reason about its own position or track how the market has evolved. Multi-turn history within an episode makes Claude a proper stateful agent.
 
 **Why is RL optional / additive?**
-The Claude agent and eval harness are fully functional without RL. RL plugs in as one more
-`BaseAgent` subclass — it doesn't change the env, the runner, or anything else.
+The Claude agent and eval harness are fully functional without RL. RL plugs in as one more `BaseAgent` subclass — it doesn't change the env, the runner, or anything else.
+
+**Why historical replay instead of live data for training?**
+Resolved markets provide ground truth (the outcome is known), giving a clear learning signal. Live markets have unknown outcomes, making reward evaluation impossible until resolution.

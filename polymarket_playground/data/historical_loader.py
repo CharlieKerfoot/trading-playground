@@ -29,6 +29,7 @@ class HistoricalLoader:
         cache: MarketCache,
         max_steps: int = 50,
         seed: int | None = None,
+        signal_provider: object | None = None,
     ) -> None:
         self.cache = cache
         self.max_steps = max_steps
@@ -40,6 +41,9 @@ class HistoricalLoader:
         # Cached per-episode data (avoid repeated DB queries)
         self._episode_outcome: float | None = None
         self._episode_meta: dict = {}
+        # Optional signal provider for enriched signals
+        self._signal_provider = signal_provider
+        self._episode_enriched_signals: dict[str, float] = {}
         # Available market IDs (refreshed on filter change)
         self._market_ids: list[str] = []
         self._refresh_market_list()
@@ -75,6 +79,15 @@ class HistoricalLoader:
             category,
             len(self._market_ids),
         )
+
+    def set_market_ids(self, market_ids: list[str]) -> None:
+        """Directly set the pool of available market IDs.
+
+        Used by walk-forward backtesting to restrict episodes to a
+        specific train or test split.
+        """
+        self._market_ids = list(market_ids)
+        logger.info("Market pool set directly: %d markets", len(self._market_ids))
 
     @property
     def available_markets(self) -> int:
@@ -127,10 +140,7 @@ class HistoricalLoader:
         # Cache per-episode data
         self._episode_meta = meta
 
-        row = self.cache._conn.execute(
-            "SELECT outcome FROM markets WHERE id = ?", (market_id,)
-        ).fetchone()
-        self._episode_outcome = float(row["outcome"]) if row and row["outcome"] is not None else None
+        self._episode_outcome = self.cache.get_outcome(market_id)
 
         # Slice a random window
         window_size = self.max_steps + 1
@@ -141,6 +151,16 @@ class HistoricalLoader:
             self._episode_prices = prices[start : start + window_size]
 
         question = meta.get("question", market_id)
+
+        # Fetch enriched signals once per episode (cached by provider)
+        self._episode_enriched_signals = {}
+        if self._signal_provider is not None:
+            try:
+                self._episode_enriched_signals = self._signal_provider.get_signals(
+                    market_id, question, self._episode_prices[0]
+                )
+            except Exception as exc:
+                logger.warning("Signal provider failed for %s: %s", market_id, exc)
 
         # Build initial state
         yes_price = self._episode_prices[0]
@@ -169,6 +189,10 @@ class HistoricalLoader:
         is_resolved = is_last and outcome is not None
         resolution = outcome if is_resolved else None
 
+        # On resolution, snap prices to settlement values so reward
+        # calculation sees the correct terminal value (1.0/0.0).
+        if is_resolved:
+            yes_price = resolution
         self._state = self._build_state_from_price(
             market_id=self._state.market_id,
             question=self._state.question,
@@ -193,7 +217,8 @@ class HistoricalLoader:
         outcome: float | None = None,
     ) -> MarketState:
         """Build a MarketState from a single historical price point."""
-        yes_price = max(0.001, min(0.999, yes_price))
+        if not is_resolved:
+            yes_price = max(0.001, min(0.999, yes_price))
         no_price = round(1.0 - yes_price, 4)
 
         # Realistic spread based on price level
@@ -221,6 +246,10 @@ class HistoricalLoader:
             "volume_24hr": volume_24hr,
             "liquidity": liquidity,
         }
+
+        # Merge enriched signals from signal provider (if any)
+        if self._episode_enriched_signals:
+            signals.update(self._episode_enriched_signals)
 
         return MarketState(
             market_id=market_id,

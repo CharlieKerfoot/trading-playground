@@ -222,21 +222,6 @@ class RunManager:
 
     @staticmethod
     def _make_agent(agent_type: str, config: dict, env: TradingEnv):
-        if agent_type == "rule":
-            from polymarket_playground.agents.rule_agent import RuleAgent
-            return RuleAgent()
-        elif agent_type == "claude":
-            from polymarket_playground.agents.claude_agent import ClaudeAgent
-            return ClaudeAgent(**{k: v for k, v in config.items() if k in ("model", "api_key")})
-        elif agent_type == "random":
-            from polymarket_playground.agents.rl_agent import RLAgent
-            return RLAgent(policy=None)
-        elif agent_type == "rl":
-            from polymarket_playground.agents.rl_agent import RLAgent
-            model_path = config.get("model_path", "")
-            if model_path:
-                algorithm = config.get("algorithm", "PPO")
-                return RLAgent.load(model_path, algorithm=algorithm)
-            return RLAgent(policy=None)
-        else:
-            raise ValueError(f"Unknown agent type: {agent_type}")
+        from polymarket_playground.agents import create_agent
+
+        return create_agent(agent_type, config)

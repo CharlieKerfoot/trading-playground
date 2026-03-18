@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from polymarket_playground.core.env import TradingEnv
 from polymarket_playground.data.market_cache import MarketCache
@@ -38,6 +38,27 @@ AGENT_TYPES = {
         "config_params": {"model_path": "", "algorithm": "PPO"},
     },
 }
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+
+class SyncRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=10000)
+
+
+class CreateRunRequest(BaseModel):
+    agent_type: str = Field(default="rule")
+    num_episodes: int = Field(default=50, ge=1, le=10000)
+    agent_config: dict = Field(default_factory=dict)
+
+
+class TrainRLRequest(BaseModel):
+    timesteps: int = Field(default=100_000, ge=1000, le=10_000_000)
+    algorithm: str = Field(default="PPO", pattern=r"^(PPO|A2C)$")
+    save_path: str = Field(default="")
+
 
 # Globals initialized at startup
 _cache: MarketCache | None = None
@@ -141,15 +162,15 @@ async def data_stats():
 
 
 @app.post("/api/data/sync")
-async def data_sync(body: dict[str, Any] | None = None):
+async def data_sync(body: SyncRequest | None = None):
     """Trigger a background sync of resolved markets."""
     global _sync_task, _sync_status
 
     if _sync_status["running"]:
         return {"status": "already_running", **_sync_status}
 
-    body = body or {}
-    limit = body.get("limit", 100)
+    body = body or SyncRequest()
+    limit = body.limit
 
     _sync_status = {"running": True, "fetched": 0, "skipped": 0, "errors": 0}
 
@@ -190,14 +211,14 @@ async def sync_status():
 
 
 @app.post("/api/runs")
-async def create_run(body: dict[str, Any]):
+async def create_run(body: CreateRunRequest):
     """Create and start a training run."""
     rm = _get_run_manager()
     cache = _get_cache()
 
-    agent_type = body.get("agent_type", "rule")
-    num_episodes = body.get("num_episodes", 50)
-    agent_config = body.get("agent_config", {})
+    agent_type = body.agent_type
+    num_episodes = body.num_episodes
+    agent_config = body.agent_config
 
     run = rm.create_run(
         agent_type=agent_type,
@@ -277,16 +298,16 @@ async def list_agents():
 
 
 @app.post("/api/train/rl")
-async def train_rl(body: dict[str, Any]):
+async def train_rl(body: TrainRLRequest):
     """Start RL training in the background."""
     global _rl_train_task, _rl_train_status
 
     if _rl_train_status["running"]:
         return {"status": "already_running", **_rl_train_status}
 
-    timesteps = body.get("timesteps", 100_000)
-    algorithm = body.get("algorithm", "PPO").upper()
-    save_path = body.get("save_path", f"models/{algorithm.lower()}_agent")
+    timesteps = body.timesteps
+    algorithm = body.algorithm.upper()
+    save_path = body.save_path or f"models/{algorithm.lower()}_agent"
 
     _rl_train_status = {
         "running": True,
