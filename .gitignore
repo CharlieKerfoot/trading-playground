@@ -1,6 +1,7 @@
 models/
-__pycache__
 episodes.db
+__pycache__/
+*.py[cod]
 
 # Internal CC Configs
 PLAN.md
