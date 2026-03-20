@@ -2,7 +2,7 @@
 
 Agent-agnostic, market-agnostic training environment for prediction market agents. Uses **real Polymarket data** — historical prices, orderbooks, and signals from the Gamma and CLOB APIs. Plug in Claude, RL policies, or rule-based bots — all against the same Gymnasium-compatible environment.
 
-Includes an **end-to-end pipeline** from data sync to deployment recommendation: information signal analysis, walk-forward backtesting with temporal train/test splits, statistical validation, and a Claude learning loop that improves across training batches.
+Includes an **end-to-end pipeline** from data sync to deployment recommendation: information signal analysis, walk-forward backtesting with temporal train/test splits, statistical validation, and a Claude learning loop that improves across training batches. Full deployment safety: mode isolation, risk gates, canary paper trading, sim-to-real fidelity scoring, ELO tournaments, and API cost tracking.
 
 ## Quick Start
 
@@ -126,7 +126,13 @@ Launch both the FastAPI backend and SvelteKit frontend with `main.py serve`.
 | `pipeline` | End-to-end: sync → split → train → validate → rank → recommend |
 | `replay` | Replay episode with price chart, trades, P&L, reasoning |
 | `live` | Run agent against live Polymarket data (paper/live/dry-run) |
-| `stats` | Show cached data statistics |
+| `tournament` | Run round-robin tournament between agents with ELO ranking |
+| `rankings` | Show current ELO rankings from tournament history |
+| `canary-start` | Start canary paper trading run for deployment validation |
+| `canary-status` | Check status and confidence of canary runs |
+| `fidelity-report` | Show sim-to-real fidelity report from paper fills |
+| `api-costs` | Show API token usage and cost breakdown |
+| `stats` | Show cached data statistics (categories + regimes) |
 | `sessions` | List past trading sessions |
 | `session-report` | Detailed report for a trading session |
 | `serve` | Launch web UI (API + frontend) |
@@ -138,9 +144,9 @@ polymarket_playground/
 ├── core/           # TradingEnv, MarketState, Action, Position
 ├── agents/         # Claude, RL, rule-based agents + strategy memory
 ├── data/           # Polymarket client, SQLite cache, signal providers
-├── execution/      # Paper + live executors with slippage model
-├── eval/           # Episode runner, metrics, validation, RL training
-├── training/       # Run manager, live trading loop
+├── execution/      # Paper, live, dry-run executors + risk gate + slippage model
+├── eval/           # Episode runner, metrics, validation, fidelity, tournament
+├── training/       # Run manager, live trading loop, canary paper trading
 └── server.py       # FastAPI + WebSocket backend
 
 web/                # SvelteKit frontend (Svelte 5 + TypeScript)
@@ -165,7 +171,45 @@ This gives the RL agent both a dense learning signal (don't overtrade, manage fe
 | `SignalProvider` | ABC for enriching markets with information signals |
 | `StrategyMemory` | Persistent learning across training batches |
 | `PaperExecutor` | Simulated fills with quadratic slippage model |
+| `DryRunExecutor` | Logs orders without sending — for dry-run mode |
+| `RiskGate` | Safety limits: kill switch, stop loss, position/exposure limits, rate limiting |
 | `ValidationResult` | Statistical validation: t-test, Sharpe CI, significance |
+| `FidelityValidator` | Sim-to-real comparison: paper fills vs real orderbook |
+| `Tournament` | ELO-ranked head-to-head agent competition |
+| `CanaryManager` | Paper trading validation before live deployment |
+| `CostTracker` | API token usage and cost tracking per model |
+
+## Deployment Safety
+
+Multiple safety layers prevent accidental real orders:
+
+1. **Mode Isolation** — `LiveExecutor` requires `TRADING_MODE=live` env var AND `~/.polymarket-live-enabled` confirmation file
+2. **Risk Gate** — Kill switch (session loss limit), per-market stop loss, position/exposure limits, rate limiting, cooldown after close
+3. **Dry-Run Mode** — `--mode dry-run` logs what WOULD be sent without placing orders
+4. **Canary Trading** — Paper trade on live data for 24-72h before deploying, with confidence scoring
+5. **Fidelity Validation** — Compare paper fills vs real orderbook to measure simulation accuracy
+
+### Deployment Workflow
+
+```bash
+# 1. Run pipeline to identify best strategy
+uv run python main.py pipeline --agents rule --agents claude --signals
+
+# 2. Run tournament to validate across many episodes
+uv run python main.py tournament --agents rule --agents claude --episodes 50
+
+# 3. Start canary paper trading on live data
+uv run python main.py canary-start --agent rule --markets <ids> --hours 24
+
+# 4. Check canary results and confidence score
+uv run python main.py canary-status
+
+# 5. Check sim-to-real fidelity
+uv run python main.py fidelity-report
+
+# 6. Monitor API costs
+uv run python main.py api-costs
+```
 
 ## Agents
 

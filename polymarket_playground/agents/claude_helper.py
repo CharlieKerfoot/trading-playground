@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import time
+from datetime import datetime, timezone
 
 import anthropic
 
@@ -14,6 +16,86 @@ logger = logging.getLogger(__name__)
 # Model defaults per use case
 MODEL_TRADING = "claude-sonnet-4-6"
 MODEL_ANALYSIS = "claude-haiku-4-5"
+
+# Pricing per million tokens (USD)
+_PRICING = {
+    MODEL_ANALYSIS: {"input": 0.80, "output": 4.00},
+    MODEL_TRADING: {"input": 3.00, "output": 15.00},
+}
+
+
+class CostTracker:
+    """Accumulates API token usage and costs, persists to SQLite."""
+
+    def __init__(self, db_path: str = "market_data.db"):
+        self.db_path = db_path
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost_usd = 0.0
+        self.call_count = 0
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+    def log_usage(self, model: str, input_tokens: int, output_tokens: int):
+        """Record a single API call's token usage."""
+        pricing = _PRICING.get(model, {"input": 3.00, "output": 15.00})
+        cost = (
+            input_tokens * pricing["input"] / 1_000_000
+            + output_tokens * pricing["output"] / 1_000_000
+        )
+
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost
+        self.call_count += 1
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO api_usage (timestamp, model, input_tokens, output_tokens, cost_usd) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), model, input_tokens, output_tokens, cost),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            logger.warning("Failed to persist API usage: %s", exc)
+
+    def summary(self) -> str:
+        """Return a human-readable cost summary for the current session."""
+        if self.call_count == 0:
+            return "API cost: $0.00 (0 calls)"
+        in_k = self.total_input_tokens / 1000
+        out_k = self.total_output_tokens / 1000
+        return (
+            f"API cost: ${self.total_cost_usd:.2f} "
+            f"({self.call_count} calls, input: {in_k:.1f}k tokens, output: {out_k:.1f}k tokens)"
+        )
+
+    def reset(self):
+        """Reset session counters (does not affect persisted data)."""
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost_usd = 0.0
+        self.call_count = 0
+
+
+# Module-level singleton
+cost_tracker = CostTracker()
 
 
 def get_client(api_key: str | None = None) -> anthropic.Anthropic | None:
@@ -54,6 +136,11 @@ def call_claude(
             if system:
                 kwargs["system"] = system
             response = client.messages.create(**kwargs)
+            cost_tracker.log_usage(
+                model,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            )
             return response.content[0].text
 
         except anthropic.RateLimitError:

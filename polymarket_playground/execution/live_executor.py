@@ -22,6 +22,10 @@ class LiveExecutor(BaseExecutor):
         POLYMARKET_API_KEY — CLOB API key
         POLYMARKET_PRIVATE_KEY — wallet private key for signing
         POLYMARKET_CHAIN_ID — chain ID (default: 137 for Polygon mainnet)
+
+    Safety requirements (mode isolation):
+        TRADING_MODE env var must be set to "live"
+        ~/.polymarket-live-enabled confirmation file must exist
     """
 
     def __init__(
@@ -32,6 +36,22 @@ class LiveExecutor(BaseExecutor):
         max_slippage: float = 0.02,
         order_timeout: float = 30.0,
     ):
+        # --- Mode isolation safety checks ---
+        trading_mode = os.environ.get("TRADING_MODE", "paper")
+        if trading_mode != "live":
+            raise RuntimeError(
+                "LiveExecutor requires TRADING_MODE=live environment variable. "
+                f"Current value: {trading_mode!r}. "
+                "Set TRADING_MODE=live to confirm you want real orders."
+            )
+
+        confirmation_file = os.path.expanduser("~/.polymarket-live-enabled")
+        if not os.path.isfile(confirmation_file):
+            raise RuntimeError(
+                "LiveExecutor requires a confirmation file at ~/.polymarket-live-enabled. "
+                "Create it with: touch ~/.polymarket-live-enabled"
+            )
+
         self.api_key = api_key or os.environ.get("POLYMARKET_API_KEY", "")
         self.private_key = private_key or os.environ.get("POLYMARKET_PRIVATE_KEY", "")
         self.chain_id = chain_id or int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import click
 from rich.console import Console
 from rich.table import Table
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -238,6 +242,10 @@ def train(agent: str, episodes: int, category: str | None, signals: bool):
     console.print(f"  Avg P&L:       {avg_pnl(results):+.6f}")
     console.print(f"  Max Drawdown:  {max_drawdown(results):+.6f}")
 
+    from polymarket_playground.agents.claude_helper import cost_tracker
+    if cost_tracker.call_count > 0:
+        console.print(f"\n[dim]{cost_tracker.summary()}[/dim]")
+
 
 @cli.command(name="train-rl")
 @click.option("--timesteps", default=100_000, help="Training timesteps")
@@ -388,6 +396,13 @@ def stats():
     else:
         console.print("[dim]No data cached yet.[/dim]")
 
+    # Show regime breakdown if available
+    if s.get("regimes"):
+        console.print()
+        console.print("[bold]Regimes:[/bold]")
+        for regime, count in sorted(s["regimes"].items(), key=lambda x: -x[1]):
+            console.print(f"  {regime}: {count}")
+
 
 @cli.command()
 @click.option("--agent", default="rule", help="Agent type: rule, claude, random, rl:<path>")
@@ -447,11 +462,17 @@ def live(
 
     # Build executor based on mode
     if mode == "live":
+        import os as _os
+        _os.environ["TRADING_MODE"] = "live"
         from polymarket_playground.execution.live_executor import LiveExecutor
         executor = LiveExecutor(max_slippage=0.02)
         console.print("\n[bold red]LIVE MODE — real orders will be placed![/bold red]")
         if not click.confirm("Continue?"):
             return
+    elif mode == "dry-run":
+        from polymarket_playground.execution.dry_run_executor import DryRunExecutor
+        executor = DryRunExecutor()
+        console.print("\n[bold yellow]DRY-RUN MODE — orders will be logged, not sent.[/bold yellow]")
     else:
         from polymarket_playground.execution.paper_executor import PaperExecutor
         executor = PaperExecutor()
@@ -634,6 +655,12 @@ def pipeline(
     if len(train_ids) < 5:
         console.print(f"[red]Too few training markets ({len(train_ids)}). Need ≥5.[/red]")
         return
+    if len(test_ids) == 0:
+        console.print(
+            f"[red]No test markets after temporal split.[/red] "
+            f"Try syncing more markets or adjusting --train-split."
+        )
+        return
     if len(test_ids) < 3:
         console.print(f"[yellow]Warning: only {len(test_ids)} test markets.[/yellow]")
 
@@ -759,6 +786,10 @@ def pipeline(
         console.print("Run with: python main.py live --agent <name> --markets <ids> --mode paper")
     else:
         console.print("\n[yellow]No strategies passed validation. More training or better signals needed.[/yellow]")
+
+    from polymarket_playground.agents.claude_helper import cost_tracker
+    if cost_tracker.call_count > 0:
+        console.print(f"\n[dim]{cost_tracker.summary()}[/dim]")
 
 
 @cli.command()
@@ -946,6 +977,328 @@ def replay(agent: str, market_id: str | None, max_steps: int, category: str | No
     console.print(f"  Final price: {final_state.get('yes_price', 0):.4f}")
     console.print(f"  Realized P&L: {final_pos.get('realized_pnl', 0):+.4f}")
     console.print(f"  Total reward: {result.total_reward:+.4f}")
+
+
+@cli.command(name="fidelity-report")
+def fidelity_report():
+    """Show sim-to-real fidelity report from recorded paper fills."""
+    from polymarket_playground.eval.fidelity import FidelityValidator
+
+    validator = FidelityValidator()
+    report = validator.report()
+
+    if report.n_records == 0:
+        console.print("[dim]No paper fills recorded yet.[/dim]")
+        console.print("Run a paper trading session with --mode paper to collect data.")
+        return
+
+    console.print(f"[bold]Sim-to-Real Fidelity Report[/bold]")
+    console.print(f"  Fills compared: {report.n_records}")
+    console.print(f"  Fidelity Score: [bold]{report.fidelity_score:.4f}[/bold]")
+    console.print(f"  Mean slippage error: {report.mean_slippage_error:+.6f}")
+    console.print(f"  Mean |error|:        {report.mean_abs_error:.6f}")
+    console.print(f"  Max  |error|:        {report.max_slippage_error:.6f}")
+
+    if report.fidelity_score >= 0.9:
+        console.print("\n[green]High fidelity — paper fills closely match real book.[/green]")
+    elif report.fidelity_score >= 0.7:
+        console.print("\n[yellow]Moderate fidelity — paper fills have some divergence from real book.[/yellow]")
+    else:
+        console.print("\n[red]Low fidelity — paper fills diverge significantly from real book.[/red]")
+
+
+@cli.command()
+@click.option("--agents", multiple=True, required=True, help="Agent types to compete")
+@click.option("--episodes", default=20, help="Episodes per match")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--signals/--no-signals", default=False, help="Enable Claude signal analysis")
+def tournament(agents: tuple[str], episodes: int, category: str | None, signals: bool):
+    """Run a tournament between agents and update ELO rankings."""
+    from itertools import combinations
+
+    from polymarket_playground.core.env import TradingEnv
+    from polymarket_playground.data.market_cache import MarketCache
+    from polymarket_playground.eval.tournament import Tournament
+
+    cache = MarketCache()
+    stats = cache.stats()
+    if stats["total_markets"] == 0:
+        console.print("[red]No markets in cache.[/red] Run sync first.")
+        return
+
+    signal_provider = _get_signal_provider("historical") if signals else None
+    env = TradingEnv(cache=cache, config={"max_steps": 100}, signal_provider=signal_provider)
+    if category:
+        env.data.set_market_filter(category)
+
+    t = Tournament()
+    agent_objs = {}
+    for name in agents:
+        agent_objs[name] = _get_agent(name)
+
+    pairs = list(combinations(agents, 2))
+    console.print(f"[bold]Tournament: {len(pairs)} matches ({episodes} episodes each)[/bold]")
+
+    for a_name, b_name in pairs:
+        console.print(f"\n  [cyan]{a_name}[/cyan] vs [cyan]{b_name}[/cyan]...")
+        results = t.run_match(
+            env, a_name, agent_objs[a_name], b_name, agent_objs[b_name],
+            n_episodes=episodes,
+        )
+        wins_a = sum(1 for r in results if r.winner == a_name)
+        wins_b = sum(1 for r in results if r.winner == b_name)
+        draws = sum(1 for r in results if r.winner == "draw")
+        console.print(f"    {a_name}: {wins_a}W | {b_name}: {wins_b}W | Draws: {draws}")
+
+    # Show updated rankings
+    _show_rankings(t)
+
+
+@cli.command()
+def rankings():
+    """Show current ELO rankings from tournament history."""
+    from polymarket_playground.eval.tournament import Tournament
+
+    t = Tournament()
+    _show_rankings(t)
+
+
+def _show_rankings(t):
+    """Display ELO rankings table."""
+    rankings = t.get_rankings()
+    if not rankings:
+        console.print("[dim]No rankings yet. Run a tournament first.[/dim]")
+        return
+
+    table = Table(title="Agent ELO Rankings")
+    table.add_column("Rank", style="dim")
+    table.add_column("Agent", style="cyan")
+    table.add_column("ELO", style="bold")
+    table.add_column("Matches")
+    table.add_column("W/L/D")
+    table.add_column("Win Rate", style="green")
+
+    for i, r in enumerate(rankings):
+        table.add_row(
+            str(i + 1),
+            r.agent_name,
+            f"{r.elo:.0f}",
+            str(r.matches),
+            f"{r.wins}/{r.losses}/{r.draws}",
+            f"{r.win_rate:.1%}",
+        )
+    console.print(table)
+
+
+@cli.command(name="canary-start")
+@click.option("--agent", required=True, help="Agent type to paper trade")
+@click.option("--markets", required=True, help="Comma-separated market IDs")
+@click.option("--hours", default=24.0, help="Duration in hours")
+@click.option("--interval", default=60, help="Seconds between ticks")
+@click.option("--capital", default=100.0, help="Starting capital (USD)")
+def canary_start(agent: str, markets: str, hours: float, interval: int, capital: float):
+    """Start a canary paper trading run for deployment validation."""
+    from polymarket_playground.training.canary import CanaryConfig, CanaryManager
+
+    market_ids = [m.strip() for m in markets.split(",") if m.strip()]
+    if not market_ids:
+        console.print("[red]No market IDs provided.[/red]")
+        return
+
+    config = CanaryConfig(
+        agent_name=agent,
+        market_ids=market_ids,
+        duration_hours=hours,
+        interval_seconds=interval,
+        starting_capital=capital,
+    )
+
+    manager = CanaryManager()
+    canary_id = manager.start_canary(config)
+
+    console.print(f"[bold green]Canary #{canary_id} started[/bold green]")
+    console.print(f"  Agent: {agent}")
+    console.print(f"  Markets: {len(market_ids)}")
+    console.print(f"  Duration: {hours}h")
+    console.print(f"  Interval: {interval}s")
+    console.print(f"  Capital: ${capital:.2f}")
+    console.print()
+
+    # Run the canary inline (blocking)
+    import signal as sig
+
+    from polymarket_playground.execution.paper_executor import PaperExecutor
+    from polymarket_playground.core.portfolio import Portfolio
+    from polymarket_playground.markets.polymarket import PolymarketAdapter
+
+    agent_obj = _get_agent(agent)
+    executor = PaperExecutor()
+    adapter = PolymarketAdapter()
+    portfolio = Portfolio(starting_capital=capital)
+    running = True
+    import time
+    deadline = time.time() + hours * 3600
+
+    def handle_signal(signum, frame):
+        nonlocal running
+        running = False
+
+    old_handler = sig.signal(sig.SIGINT, handle_signal)
+
+    console.print("[bold]Running canary...[/bold] (Ctrl+C to stop)\n")
+    tick_count = 0
+    try:
+        while running and time.time() < deadline:
+            for mid in market_ids:
+                try:
+                    state = adapter.build_state(mid)
+                    position = portfolio.get_position(mid)
+                    state.agent_yes_shares = position.yes_shares
+                    state.agent_no_shares = position.no_shares
+                    state.agent_cost_basis = position.cost_basis
+                    state.agent_realized_pnl = position.realized_pnl
+
+                    action = agent_obj.act(state)
+                    fill = None
+                    if not action.is_hold:
+                        fill = executor.execute(action, state, position)
+                        if fill:
+                            portfolio.update(mid, fill)
+
+                    prices = {mid: state.yes_price}
+                    pnl = portfolio.total_pnl(prices)
+                    manager.record_tick(
+                        canary_id, mid, state.yes_price,
+                        action.direction_name, 0.0, pnl,
+                    )
+                except Exception as exc:
+                    logger.warning("Canary tick error on %s: %s", mid, exc)
+
+            tick_count += 1
+            elapsed_h = (time.time() - (deadline - hours * 3600)) / 3600
+            console.print(
+                f"  Tick {tick_count} | "
+                f"Elapsed: {elapsed_h:.1f}h / {hours}h | "
+                f"P&L: {portfolio.total_pnl({}):.4f}",
+                end="\r",
+            )
+            if running:
+                time.sleep(interval)
+    finally:
+        sig.signal(sig.SIGINT, old_handler)
+        manager.stop_canary(canary_id)
+
+    console.print()
+    confidence = manager.compute_confidence(canary_id)
+    console.print(f"\n[bold]Canary #{canary_id} complete[/bold]")
+    console.print(f"  Ticks: {tick_count}")
+    console.print(f"  Confidence Score: [bold]{confidence:.4f}[/bold]")
+
+    if confidence >= 0.7:
+        console.print("[green]READY for deployment[/green]")
+    elif confidence >= 0.4:
+        console.print("[yellow]CAUTIOUS — consider extending canary duration[/yellow]")
+    else:
+        console.print("[red]NOT READY — canary results are poor[/red]")
+
+
+@cli.command(name="canary-status")
+@click.option("--id", "canary_id", default=None, type=int, help="Specific canary ID")
+def canary_status(canary_id: int | None):
+    """Check status of canary paper trading runs."""
+    from polymarket_playground.training.canary import CanaryManager
+    from datetime import datetime
+
+    manager = CanaryManager()
+
+    if canary_id:
+        status = manager.get_status(canary_id)
+        if not status:
+            console.print(f"[red]Canary #{canary_id} not found.[/red]")
+            return
+        statuses = [status]
+    else:
+        statuses = manager.get_all_canaries()
+
+    if not statuses:
+        console.print("[dim]No canary runs found.[/dim]")
+        return
+
+    table = Table(title="Canary Runs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Agent")
+    table.add_column("Started")
+    table.add_column("Elapsed")
+    table.add_column("Ticks")
+    table.add_column("P&L", style="green")
+    table.add_column("Confidence", style="bold")
+    table.add_column("Status")
+
+    for s in statuses:
+        started = datetime.fromtimestamp(s.started_at).strftime("%Y-%m-%d %H:%M")
+        status_str = "[green]RUNNING[/green]" if s.is_running else "[dim]STOPPED[/dim]"
+        table.add_row(
+            str(s.canary_id),
+            s.agent_name,
+            started,
+            f"{s.elapsed_hours:.1f}h",
+            str(s.ticks),
+            f"{s.total_pnl:+.4f}",
+            f"{s.confidence_score:.4f}",
+            status_str,
+        )
+
+    console.print(table)
+
+
+@cli.command(name="api-costs")
+def api_costs():
+    """Show API cost summary from token usage tracking."""
+    from polymarket_playground.agents.claude_helper import cost_tracker
+
+    import sqlite3
+    try:
+        conn = sqlite3.connect("market_data.db")
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT model, SUM(input_tokens) as total_in, "
+            "SUM(output_tokens) as total_out, SUM(cost_usd) as total_cost, "
+            "COUNT(*) as calls FROM api_usage GROUP BY model"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        console.print("[dim]No API usage data found.[/dim]")
+        return
+
+    if not rows:
+        console.print("[dim]No API usage data found.[/dim]")
+        return
+
+    table = Table(title="API Cost Breakdown")
+    table.add_column("Model", style="cyan")
+    table.add_column("Calls")
+    table.add_column("Input Tokens")
+    table.add_column("Output Tokens")
+    table.add_column("Cost (USD)", style="green")
+
+    total_cost = 0.0
+    total_calls = 0
+    for row in rows:
+        table.add_row(
+            row["model"],
+            f"{row['calls']:,}",
+            f"{row['total_in']:,}",
+            f"{row['total_out']:,}",
+            f"${row['total_cost']:.2f}",
+        )
+        total_cost += row["total_cost"]
+        total_calls += row["calls"]
+
+    console.print(table)
+    console.print(f"\n[bold]Total: ${total_cost:.2f} across {total_calls:,} calls[/bold]")
+
+    # Session summary
+    console.print(f"\n[dim]Current session: {cost_tracker.summary()}[/dim]")
 
 
 def _print_ascii_chart(

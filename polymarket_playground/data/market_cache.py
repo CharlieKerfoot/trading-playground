@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 from pathlib import Path
@@ -54,6 +55,7 @@ class MarketCache:
         self._conn.execute(self._CREATE_PRICES)
         self._conn.execute(self._CREATE_PRICE_INDEX)
         self._migrate_category_column()
+        self._migrate_regime_column()
         self._conn.commit()
         self._client = PolymarketClient()
 
@@ -82,6 +84,78 @@ class MarketCache:
                 )
         if rows:
             logger.info("Backfilled categories for %d markets", len(rows))
+
+    def _migrate_regime_column(self) -> None:
+        """Add regime column if it doesn't exist (migration for existing DBs)."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(markets)").fetchall()
+        }
+        if "regime" not in cols:
+            self._conn.execute("ALTER TABLE markets ADD COLUMN regime TEXT")
+
+    @staticmethod
+    def classify_regime(prices: list[float], volume: float = 0.0) -> str:
+        """Classify a market's regime from its price history.
+
+        Returns one of: trending, mean_reverting, high_volatility,
+        low_liquidity, neutral.
+        """
+        if len(prices) < 10:
+            return "neutral"
+        returns = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+        mean_r = sum(returns) / len(returns)
+        var_r = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+        if var_r == 0:
+            return "neutral"
+        autocorr = sum(
+            (returns[i] - mean_r) * (returns[i + 1] - mean_r)
+            for i in range(len(returns) - 1)
+        ) / (var_r * (len(returns) - 1))
+        vol = math.sqrt(var_r)
+        if volume > 0 and volume < 1000:
+            return "low_liquidity"
+        if vol > 0.05:
+            return "high_volatility"
+        if autocorr > 0.1:
+            return "trending"
+        if autocorr < -0.1:
+            return "mean_reverting"
+        return "neutral"
+
+    def tag_regimes(self) -> int:
+        """Classify all untagged markets and store the regime. Returns count tagged."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, volume FROM markets WHERE regime IS NULL"
+            ).fetchall()
+        tagged = 0
+        for row in rows:
+            market_id = row["id"]
+            volume = float(row["volume"] or 0)
+            history = self.get_price_history(market_id)
+            prices = [h["p"] for h in history]
+            regime = self.classify_regime(prices, volume)
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE markets SET regime = ? WHERE id = ?",
+                    (regime, market_id),
+                )
+            tagged += 1
+        if tagged:
+            with self._lock:
+                self._conn.commit()
+            logger.info("Tagged regimes for %d markets", tagged)
+        return tagged
+
+    def get_market_ids_by_regime(self, regime: str) -> list[str]:
+        """Return market IDs matching the given regime."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM markets WHERE regime = ? ORDER BY volume DESC",
+                (regime,),
+            ).fetchall()
+        return [row["id"] for row in rows]
 
     @staticmethod
     def _extract_category(meta: dict) -> str | None:
@@ -291,7 +365,7 @@ class MarketCache:
         return [{"t": r["timestamp"], "p": r["price"]} for r in rows]
 
     def stats(self) -> dict:
-        """Return cache statistics: total markets, total price points, categories."""
+        """Return cache statistics: total markets, total price points, categories, regimes."""
         with self._lock:
             total = self._conn.execute("SELECT COUNT(*) AS cnt FROM markets").fetchone()["cnt"]
             points = self._conn.execute("SELECT COUNT(*) AS cnt FROM price_history").fetchone()["cnt"]
@@ -299,12 +373,18 @@ class MarketCache:
                 "SELECT COALESCE(category, 'uncategorized') AS cat, COUNT(*) AS cnt "
                 "FROM markets GROUP BY cat ORDER BY cnt DESC"
             ).fetchall()
+            regime_rows = self._conn.execute(
+                "SELECT COALESCE(regime, 'untagged') AS reg, COUNT(*) AS cnt "
+                "FROM markets GROUP BY reg ORDER BY cnt DESC"
+            ).fetchall()
         categories = {row["cat"]: row["cnt"] for row in cat_rows}
+        regimes = {row["reg"]: row["cnt"] for row in regime_rows}
 
         return {
             "total_markets": total,
             "total_price_points": points,
             "categories": categories,
+            "regimes": regimes,
         }
 
     def get_outcome(self, market_id: str) -> float | None:

@@ -167,7 +167,11 @@ class ClaudeAgent(BaseAgent):
             raw = '{"action": "hold", "size": 0.0, "reasoning": "api error"}'
             action = Action(direction=0, size=0.0, reasoning="api error")
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-            logger.warning("Failed to parse Claude response, defaulting to hold: %s", exc)
+            logger.warning(
+                "Failed to parse Claude response, defaulting to hold. "
+                "Error: %s | Raw response: %.500s",
+                exc, raw,
+            )
             raw = '{"action": "hold", "size": 0.0, "reasoning": "parse error fallback"}'
             action = Action(direction=0, size=0.0, reasoning="parse error fallback")
 
