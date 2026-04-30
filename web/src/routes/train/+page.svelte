@@ -68,11 +68,15 @@
 
   async function handleRLTrain() {
     rlTraining = true;
-    await startRLTraining({
-      timesteps: rlTimesteps,
-      algorithm: rlAlgorithm,
-    });
-    startRLPolling();
+    try {
+      await startRLTraining({
+        timesteps: rlTimesteps,
+        algorithm: rlAlgorithm,
+      });
+      startRLPolling();
+    } catch (e) {
+      rlTraining = false;
+    }
   }
 
   function startRLPolling() {
