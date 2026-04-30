@@ -26,6 +26,7 @@
 	});
 
 	function startPolling() {
+		if (pollInterval) clearInterval(pollInterval);
 		pollInterval = setInterval(async () => {
 			syncStatus = await fetchSyncStatus();
 			if (!syncStatus.running) {
