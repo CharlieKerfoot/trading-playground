@@ -141,7 +141,12 @@ def call_claude(
                 response.usage.input_tokens,
                 response.usage.output_tokens,
             )
-            return response.content[0].text
+            for block in response.content:
+                text = getattr(block, "text", None)
+                if text is not None:
+                    return text
+            logger.warning("Claude response contained no text block")
+            return None
 
         except anthropic.RateLimitError:
             wait = 2 ** attempt
