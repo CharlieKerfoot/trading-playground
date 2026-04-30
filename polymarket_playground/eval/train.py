@@ -203,11 +203,15 @@ class RLTrainer:
 
     def train(self, timesteps: int = 100_000) -> None:
         """Train the SB3 model for *timesteps* environment steps."""
+        import copy
+
         from stable_baselines3.common.callbacks import EvalCallback
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-        # Create a separate eval env sharing normalization stats from training
-        eval_wrapped = GymWrapper(self.wrapped_env.env)
+        # Create a separate eval env sharing normalization stats from training.
+        # Deep-copy the underlying TradingEnv so eval episodes do not mutate
+        # the training env's internal state (and vice versa).
+        eval_wrapped = GymWrapper(copy.deepcopy(self.wrapped_env.env))
         eval_vec = DummyVecEnv([lambda: eval_wrapped])
         eval_vec = VecNormalize(
             eval_vec,
