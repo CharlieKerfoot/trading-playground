@@ -179,9 +179,10 @@ class PolymarketAdapter(MarketAdapter):
         yes_price, no_price = PolymarketClient.parse_outcome_prices(m)
 
         # Use Gamma's bestBid/bestAsk (tight market prices)
-        best_bid = m.get("bestBid") or 0.0
-        best_ask = m.get("bestAsk") or 0.0
-        spread = m.get("spread") or (best_ask - best_bid if best_bid and best_ask else 0.0)
+        best_bid = float(m.get("bestBid") or 0.0)
+        best_ask = float(m.get("bestAsk") or 0.0)
+        spread_raw = m.get("spread")
+        spread = float(spread_raw) if spread_raw else (best_ask - best_bid if best_bid and best_ask else 0.0)
 
         # Fetch orderbook for depth signals
         signals = self.fetch_signals(market_id, None)
