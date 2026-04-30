@@ -125,9 +125,14 @@ class ClaudeAgent(BaseAgent):
 
         self.history.append({"role": "user", "content": context})
 
-        # Sliding window to bound token usage
+        # Sliding window to bound token usage. Trim in user/assistant pairs so
+        # the first kept message is always a user turn (Anthropic API requires
+        # messages to start with user and alternate).
         if len(self.history) > self.MAX_HISTORY_MESSAGES:
-            self.history = self.history[-self.MAX_HISTORY_MESSAGES:]
+            trimmed = self.history[-self.MAX_HISTORY_MESSAGES:]
+            if trimmed and trimmed[0].get("role") != "user":
+                trimmed = trimmed[1:]
+            self.history = trimmed
 
         if self.client is None:
             raw = '{"action": "hold", "size": 0.0, "reasoning": "no API key"}'
