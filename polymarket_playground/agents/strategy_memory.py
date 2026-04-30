@@ -160,7 +160,7 @@ Output ONLY the updated strategy document as plain text (no code fences, no JSON
 
         lines = [
             f"Batch: {n} episodes",
-            f"Win/Loss: {wins}W / {losses}L ({wins / n:.0%} win rate)",
+            f"Win/Loss: {wins}W / {losses}L ({(wins / n) if n else 0:.0%} win rate)",
             f"Mean reward: {mean_reward:+.6f}",
             f"Best episode: {best:+.6f}",
             f"Worst episode: {worst:+.6f}",
