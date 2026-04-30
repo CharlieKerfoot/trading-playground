@@ -306,8 +306,9 @@ def train_rl(timesteps: int, algorithm: str, category: str | None, save_path: st
     eval_vec = DummyVecEnv([lambda: eval_wrapped])
     # Copy normalization stats from training
     eval_norm = VecNormalize(eval_vec, norm_obs=True, norm_reward=False, training=False)
-    eval_norm.obs_rms = trainer.vec_env.obs_rms
-    eval_norm.ret_rms = trainer.vec_env.ret_rms
+    if hasattr(trainer.vec_env, "obs_rms") and hasattr(trainer.vec_env, "ret_rms"):
+        eval_norm.obs_rms = trainer.vec_env.obs_rms
+        eval_norm.ret_rms = trainer.vec_env.ret_rms
 
     mean_reward, std_reward = evaluate_policy(
         trainer.model, eval_norm, n_eval_episodes=eval_episodes, deterministic=True
