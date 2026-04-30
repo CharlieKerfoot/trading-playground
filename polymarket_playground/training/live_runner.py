@@ -243,7 +243,7 @@ class LiveRunner:
                 state = self.adapter.build_state(market_id)
                 prices[market_id] = state.yes_price
             except Exception:
-                prices[market_id] = 0.5
+                logger.exception("Failed to fetch price for market %s; omitting from marks", market_id)
         return prices
 
     def _handle_signal(self, signum, frame):
