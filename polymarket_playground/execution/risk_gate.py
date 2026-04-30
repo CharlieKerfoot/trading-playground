@@ -132,10 +132,6 @@ class RiskGate:
                 self._log_intervention(state.market_id, action, "cooldown_after_close")
                 return None
 
-        # Close action — record timestamp for cooldown
-        if action.direction == 3:
-            self._state.close_timestamps[state.market_id] = time.time()
-
         # Rate limiting
         now = time.time()
         self._state.order_timestamps = [
@@ -145,6 +141,10 @@ class RiskGate:
             self._log_intervention(state.market_id, action, "rate_limit")
             return None
         self._state.order_timestamps.append(now)
+
+        # Close action — record timestamp for cooldown
+        if action.direction == 3:
+            self._state.close_timestamps[state.market_id] = now
 
         return action
 
