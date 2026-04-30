@@ -1147,6 +1147,7 @@ def canary_start(agent: str, markets: str, hours: float, interval: int, capital:
 
     console.print("[bold]Running canary...[/bold] (Ctrl+C to stop)\n")
     tick_count = 0
+    latest_prices: dict[str, float] = {}
     try:
         while running and time.time() < deadline:
             for mid in market_ids:
@@ -1165,8 +1166,8 @@ def canary_start(agent: str, markets: str, hours: float, interval: int, capital:
                         if fill:
                             portfolio.update(mid, fill)
 
-                    prices = {mid: state.yes_price}
-                    pnl = portfolio.total_pnl(prices)
+                    latest_prices[mid] = state.yes_price
+                    pnl = portfolio.total_pnl(latest_prices)
                     manager.record_tick(
                         canary_id, mid, state.yes_price,
                         action.direction_name, 0.0, pnl,
@@ -1179,7 +1180,7 @@ def canary_start(agent: str, markets: str, hours: float, interval: int, capital:
             console.print(
                 f"  Tick {tick_count} | "
                 f"Elapsed: {elapsed_h:.1f}h / {hours}h | "
-                f"P&L: {portfolio.total_pnl({}):.4f}",
+                f"P&L: {portfolio.total_pnl(latest_prices):.4f}",
                 end="\r",
             )
             if running:
