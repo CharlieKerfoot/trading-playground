@@ -66,20 +66,20 @@
 	let pollRef: ReturnType<typeof setInterval> | null = null;
 
 	$effect(() => {
-		if (run?.status === 'running' && !pollRef) {
-			pollRef = setInterval(async () => {
-				const id = page.params.id!;
-				const updated = await fetchRun(id);
-				run = updated;
-				if (updated.status !== 'running') {
-					if (pollRef) clearInterval(pollRef);
-					pollRef = null;
-					metrics = await fetchRunMetrics(id);
-				}
-			}, 2000);
-		}
+		if (run?.status !== 'running') return;
+		const interval = setInterval(async () => {
+			const id = page.params.id!;
+			const updated = await fetchRun(id);
+			run = updated;
+			if (updated.status !== 'running') {
+				clearInterval(interval);
+				metrics = await fetchRunMetrics(id);
+			}
+		}, 2000);
+		pollRef = interval;
 		return () => {
-			if (pollRef) clearInterval(pollRef);
+			clearInterval(interval);
+			if (pollRef === interval) pollRef = null;
 		};
 	});
 </script>
