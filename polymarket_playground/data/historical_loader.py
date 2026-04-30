@@ -226,10 +226,14 @@ class HistoricalLoader:
         spread = round(base_spread * self._rng.uniform(0.5, 1.5), 4)
         half_spread = spread / 2.0
 
-        yes_bid = round(max(0.001, yes_price - half_spread), 4)
-        yes_ask = round(min(0.999, yes_price + half_spread), 4)
-        no_bid = round(max(0.001, no_price - half_spread), 4)
-        no_ask = round(min(0.999, no_price + half_spread), 4)
+        if is_resolved:
+            yes_bid = yes_ask = round(yes_price, 4)
+            no_bid = no_ask = no_price
+        else:
+            yes_bid = round(max(0.001, yes_price - half_spread), 4)
+            yes_ask = round(min(0.999, yes_price + half_spread), 4)
+            no_bid = round(max(0.001, no_price - half_spread), 4)
+            no_ask = round(min(0.999, no_price + half_spread), 4)
 
         base_depth = float(market_meta.get("liquidityNum", 1000) or 1000)
         book_depth = round(base_depth * self._rng.uniform(0.5, 1.5), 2)
