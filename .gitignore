@@ -1,7 +1,34 @@
-models/
-episodes.db
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Vite / SvelteKit
+node_modules/
+.svelte-kit/
+.vite/
+build/
+dist/
+
+# Data / models
+models/
+*.db
+
+# Logs
+*.log
+.playwright-mcp/
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.*
+!.env.example
 
 # Internal CC Configs
 PLAN.md
