@@ -114,6 +114,12 @@ class LiveExecutor(BaseExecutor):
 
         # Price: use the ask + slippage tolerance
         base_price = state.yes_ask if is_yes else state.no_ask
+        if not (isinstance(base_price, (int, float)) and base_price == base_price and 0.0 < base_price < 1.0):
+            logger.error(
+                "No valid ask for %s on market %s (base_price=%r); aborting order",
+                "YES" if is_yes else "NO", state.market_id, base_price,
+            )
+            return None
         limit_price = min(base_price + self.max_slippage, 0.99)
 
         size = max(action.size, 1.0)  # minimum 1 share
