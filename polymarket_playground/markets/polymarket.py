@@ -66,7 +66,7 @@ class PolymarketAdapter(MarketAdapter):
 
         for m in markets:
             mid = str(m.get("id", ""))
-            liq = m.get("liquidityNum") or 0
+            liq = float(m.get("liquidityNum") or 0)
             if liq < self._min_liquidity:
                 continue
 
