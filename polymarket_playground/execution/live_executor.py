@@ -305,7 +305,11 @@ class LiveExecutor(BaseExecutor):
         """Cancel all open orders, optionally for a specific market."""
         try:
             client = self._get_client()
-            client.cancel_all()
-            logger.info("Cancelled all open orders")
+            if market_id:
+                client.cancel_market_orders(market=market_id)
+                logger.info("Cancelled open orders for market %s", market_id)
+            else:
+                client.cancel_all()
+                logger.info("Cancelled all open orders")
         except Exception:
             logger.exception("Failed to cancel all orders")
