@@ -222,8 +222,8 @@ class RLTrainer:
             training=False,
         )
         # Sync running stats so eval observations are normalized identically
-        eval_vec.obs_rms = self.vec_env.obs_rms
-        eval_vec.ret_rms = self.vec_env.ret_rms
+        eval_vec.obs_rms = copy.deepcopy(self.vec_env.obs_rms)
+        eval_vec.ret_rms = copy.deepcopy(self.vec_env.ret_rms)
 
         eval_callback = EvalCallback(
             eval_vec,
