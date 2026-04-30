@@ -141,21 +141,29 @@ class FidelityValidator:
 
         if fill.direction == "yes":
             expected_price = state.yes_ask
+            close_side = None
         elif fill.direction == "no":
             expected_price = state.no_ask
-        else:  # close
-            expected_price = state.yes_bid
+            close_side = None
+        else:  # close — pick the bid side actually closed (closer to fill price)
+            if abs(fill.price - state.no_bid) < abs(fill.price - state.yes_bid):
+                expected_price = state.no_bid
+                close_side = "no"
+            else:
+                expected_price = state.yes_bid
+                close_side = "yes"
 
         slippage_error = fill.price - expected_price
 
+        is_no_side = fill.direction == "no" or close_side == "no"
         record = FidelityRecord(
             market_id=state.market_id,
             timestamp=ts,
             direction=fill.direction,
             size=fill.size,
             paper_price=fill.price,
-            book_bid=state.yes_bid if fill.direction != "no" else state.no_bid,
-            book_ask=state.yes_ask if fill.direction != "no" else state.no_ask,
+            book_bid=state.no_bid if is_no_side else state.yes_bid,
+            book_ask=state.no_ask if is_no_side else state.yes_ask,
             slippage_error=slippage_error,
         )
 
