@@ -122,7 +122,13 @@ class LiveExecutor(BaseExecutor):
             return None
         limit_price = min(base_price + self.max_slippage, 0.99)
 
-        size = max(action.size, 1.0)  # minimum 1 share
+        if action.size < 1.0:
+            logger.error(
+                "Requested size %.4f below 1-share minimum on market %s; aborting order",
+                action.size, state.market_id,
+            )
+            return None
+        size = action.size
 
         logger.info(
             "Placing %s order: %s %.2f shares @ %.4f (limit)",
