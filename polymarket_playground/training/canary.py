@@ -149,7 +149,7 @@ class CanaryManager:
             )
             self._conn.commit()
 
-    def get_status(self, canary_id: int | None = None) -> CanaryStatus | list[CanaryStatus]:
+    def get_status(self, canary_id: int | None = None) -> CanaryStatus | list[CanaryStatus] | None:
         """Get status of a specific canary or all running canaries."""
         if canary_id is not None:
             with self._lock:
