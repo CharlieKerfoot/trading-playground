@@ -93,6 +93,15 @@ class RiskGate:
                     "Stop loss on %s: pnl=%.2f, forcing close",
                     state.market_id, market_pnl,
                 )
+                now = time.time()
+                self._state.order_timestamps = [
+                    t for t in self._state.order_timestamps if now - t < 60
+                ]
+                if len(self._state.order_timestamps) >= self.config.max_orders_per_minute:
+                    self._log_intervention(state.market_id, action, "rate_limit")
+                    return None
+                self._state.order_timestamps.append(now)
+                self._state.close_timestamps[state.market_id] = now
                 return Action(direction=3, size=1.0, reasoning="risk_gate: stop loss")
 
         # For buy actions, check position and exposure limits
