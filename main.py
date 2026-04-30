@@ -144,9 +144,17 @@ def serve(host: str, port: int):
         server_proc.terminate()
         if frontend_proc:
             frontend_proc.terminate()
-        server_proc.wait(timeout=5)
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait()
         if frontend_proc:
-            frontend_proc.wait(timeout=5)
+            try:
+                frontend_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                frontend_proc.kill()
+                frontend_proc.wait()
 
 
 @cli.command()
