@@ -142,6 +142,7 @@ class ClaudeAgent(BaseAgent):
                 + self._strategy_context
             )
 
+        raw = ""
         try:
             import anthropic
 
