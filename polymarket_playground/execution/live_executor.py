@@ -242,7 +242,7 @@ class LiveExecutor(BaseExecutor):
 
                 if status in ("matched", "filled"):
                     return {
-                        "size": float(order.get("size_matched", order.get("original_size", 0))),
+                        "size": float(order.get("size_matched", 0)),
                         "price": float(order.get("price", 0)),
                         "fees": float(order.get("fee", 0)),
                     }
